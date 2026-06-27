@@ -1,0 +1,316 @@
+"""This script replay a motion from a csv file and output it to a npz file
+
+.. code-block:: bash
+
+    # LAFAN-style (root quat xyzw + joint radians, no header). Headless is the default (servers).
+    python csv_to_npz.py --input_file LAFAN/dance1_subject2.csv --input_fps 30 --frame_range 122 722 \
+        --output_name ./motions/dance1_subject2 --output_fps 50
+
+    # BONES-SEED G1 CSV @ 120 fps
+    python csv_to_npz.py --input_file motion.csv --input_fps 120 --bones_seed_g1_csv \
+        --output_name ./motions/motion --output_fps 50
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+
+def _sanitize_python_path_for_isaac() -> None:
+    """Avoid binary incompatibility by preventing mixed user-site packages.
+
+    See batch_csv_to_npz.py for the detailed rationale.
+    """
+
+    os.environ.setdefault("PYTHONNOUSERSITE", "1")
+
+    try:
+        import site  # noqa: WPS433 (runtime import by design)
+
+        user_site = site.getusersitepackages()
+    except Exception:
+        user_site = None
+
+    def _is_user_site_path(p: str) -> bool:
+        if not p:
+            return False
+        if isinstance(user_site, str) and p == user_site:
+            return True
+        if "/.local/lib/python" in p and "site-packages" in p:
+            return True
+        return False
+
+    sys.path[:] = [p for p in sys.path if not _is_user_site_path(p)]
+
+    if "numpy" in sys.modules:
+        del sys.modules["numpy"]
+
+
+_sanitize_python_path_for_isaac()
+
+import argparse
+import numpy as np
+
+from isaaclab.app import AppLauncher
+
+# add argparse arguments
+parser = argparse.ArgumentParser(description="Replay motion from csv file and output to npz file.")
+parser.add_argument("--input_file", type=str, required=True, help="The path to the input motion csv file.")
+parser.add_argument("--input_fps", type=int, default=30, help="The fps of the input motion.")
+parser.add_argument(
+    "--frame_range",
+    nargs=2,
+    type=int,
+    metavar=("START", "END"),
+    help=(
+        "frame range: START END (both inclusive). The frame index starts from 1. If not provided, all frames will be"
+        " loaded."
+    ),
+)
+parser.add_argument("--output_name", type=str, required=True, help="The name of the motion npz file.")
+parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motion.")
+parser.add_argument(
+    "--robot",
+    type=str,
+    default="g1",
+    help="Robot platform name (e.g. g1, h1_2). See whole_body_tracking.robots.robot_registry.ROBOT_PLATFORMS.",
+)
+parser.add_argument(
+    "--bones_seed_g1_csv",
+    action="store_true",
+    help=(
+        "BONES-SEED / named-column G1 CSV: skip header row, drop leading Frame column, root euler XYZ in degrees,"
+        " joint angles in degrees (matches Isaac quat_from_euler_xyz)."
+    ),
+)
+parser.add_argument(
+    "--csv_skip_header",
+    action="store_true",
+    help="Skip the first line (column names).",
+)
+parser.add_argument(
+    "--csv_drop_frame_column",
+    action="store_true",
+    help="Drop the first numeric column (e.g. Frame index) after loading.",
+)
+parser.add_argument(
+    "--root_rotation",
+    type=str,
+    choices=("quat_xyzw", "euler_xyz_deg"),
+    default="quat_xyzw",
+    help="Root orientation: quaternion xyzw columns 3-6, or euler XYZ in degrees columns 3-5.",
+)
+parser.add_argument(
+    "--joint_angles_in_degrees",
+    action="store_true",
+    help="Convert joint DOF columns from degrees to radians.",
+)
+parser.add_argument(
+    "--position_scale",
+    type=float,
+    default=0.01,
+    help="Multiply root translation (x,y,z) by this factor (e.g. 0.01 if positions are in centimeters).",
+)
+parser.add_argument(
+    "--no_headless",
+    action="store_true",
+    help="Run with a visible window (disables headless). Default is headless for servers.",
+)
+
+# append AppLauncher cli args
+AppLauncher.add_app_launcher_args(parser)
+# parse the arguments
+args_cli = parser.parse_args()
+if args_cli.bones_seed_g1_csv:
+    args_cli.csv_skip_header = True
+    args_cli.csv_drop_frame_column = True
+    args_cli.root_rotation = "euler_xyz_deg"
+    args_cli.joint_angles_in_degrees = True
+
+# Default headless on for server runs; use --no_headless for a local window
+args_cli.headless = not args_cli.no_headless
+
+# launch omniverse app
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+"""Rest everything follows."""
+
+import torch
+
+import isaaclab.sim as sim_utils
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
+from isaaclab.sim import SimulationContext
+from isaaclab.utils import configclass
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+
+##
+# Robot platform registry
+##
+from motion_csv_loader import MotionLoader
+from whole_body_tracking.robots.robot_registry import available_robot_names, get_robot_platform
+
+
+def create_replay_scene_cfg(robot_cfg: ArticulationCfg):
+    """Create a scene configuration for replaying motions with the specified robot."""
+
+    @configclass
+    class ReplayMotionsSceneCfg(InteractiveSceneCfg):
+        """Configuration for a replay motions scene."""
+
+        # ground plane
+        ground = AssetBaseCfg(prim_path="/World/defaultGroundPlane", spawn=sim_utils.GroundPlaneCfg())
+
+        # lights
+        sky_light = AssetBaseCfg(
+            prim_path="/World/skyLight",
+            spawn=sim_utils.DomeLightCfg(
+                intensity=750.0,
+                texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
+            ),
+        )
+
+        # articulation - set based on robot type
+        robot: ArticulationCfg = robot_cfg.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+    return ReplayMotionsSceneCfg
+
+
+def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joint_names: list[str]):
+    """Runs the simulation loop."""
+    # Load motion
+    motion = MotionLoader(
+        motion_file=args_cli.input_file,
+        input_fps=args_cli.input_fps,
+        output_fps=args_cli.output_fps,
+        device=sim.device,
+        frame_range=tuple(args_cli.frame_range) if args_cli.frame_range is not None else None,
+        csv_skip_header=args_cli.csv_skip_header,
+        csv_drop_frame_column=args_cli.csv_drop_frame_column,
+        root_rotation=args_cli.root_rotation,
+        joint_angles_in_degrees=args_cli.joint_angles_in_degrees,
+        position_scale=args_cli.position_scale,
+        expected_dof_count=len(joint_names),
+    )
+
+    # Extract scene entities
+    robot = scene["robot"]
+    robot_joint_indexes = robot.find_joints(joint_names, preserve_order=True)[0]
+
+    # ------- data logger -------------------------------------------------------
+    log = {
+        "fps": [args_cli.output_fps],
+        "joint_pos": [],
+        "joint_vel": [],
+        "body_pos_w": [],
+        "body_quat_w": [],
+        "body_lin_vel_w": [],
+        "body_ang_vel_w": [],
+    }
+    file_saved = False
+    # --------------------------------------------------------------------------
+
+    # Simulation loop
+    while simulation_app.is_running():
+        (
+            (
+                motion_base_pos,
+                motion_base_rot,
+                motion_base_lin_vel,
+                motion_base_ang_vel,
+                motion_dof_pos,
+                motion_dof_vel,
+            ),
+            reset_flag,
+        ) = motion.get_next_state()
+
+        # set root state
+        root_states = robot.data.default_root_state.clone()
+        root_states[:, :3] = motion_base_pos
+        root_states[:, :2] += scene.env_origins[:, :2]
+        root_states[:, 3:7] = motion_base_rot
+        root_states[:, 7:10] = motion_base_lin_vel
+        root_states[:, 10:] = motion_base_ang_vel
+        robot.write_root_state_to_sim(root_states)
+
+        # set joint state
+        joint_pos = robot.data.default_joint_pos.clone()
+        joint_vel = robot.data.default_joint_vel.clone()
+        joint_pos[:, robot_joint_indexes] = motion_dof_pos
+        joint_vel[:, robot_joint_indexes] = motion_dof_vel
+        robot.write_joint_state_to_sim(joint_pos, joint_vel)
+        sim.render()  # We don't want physic (sim.step())
+        scene.update(sim.get_physics_dt())
+
+        pos_lookat = root_states[0, :3].cpu().numpy()
+        sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
+
+        if not file_saved:
+            log["joint_pos"].append(robot.data.joint_pos[0, :].cpu().numpy().copy())
+            log["joint_vel"].append(robot.data.joint_vel[0, :].cpu().numpy().copy())
+            log["body_pos_w"].append(robot.data.body_pos_w[0, :].cpu().numpy().copy())
+            log["body_quat_w"].append(robot.data.body_quat_w[0, :].cpu().numpy().copy())
+            log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
+            log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
+
+        if reset_flag and not file_saved:
+            file_saved = True
+            for k in (
+                "joint_pos",
+                "joint_vel",
+                "body_pos_w",
+                "body_quat_w",
+                "body_lin_vel_w",
+                "body_ang_vel_w",
+            ):
+                log[k] = np.stack(log[k], axis=0)
+
+            output_name = args_cli.output_name
+            if not output_name.endswith(".npz"):
+                output_name = f"{output_name}.npz"
+            output_path = os.path.abspath(output_name)
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            np.savez(output_path, **log)
+            print(f"[INFO]: Motion saved locally: {output_path}")
+
+
+def main():
+    """Main function."""
+    # Resolve robot platform from registry
+    try:
+        robot_platform = get_robot_platform(args_cli.robot)
+    except KeyError as e:
+        raise SystemExit(f"{e}\nAvailable robots: {available_robot_names()}") from None
+
+    # Load kit helper
+    sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
+    sim_cfg.dt = 1.0 / args_cli.output_fps
+    sim = SimulationContext(sim_cfg)
+    # Design scene
+    scene_cfg_class = create_replay_scene_cfg(robot_platform.cfg)
+    scene_cfg = scene_cfg_class(num_envs=1, env_spacing=2.0)
+    scene = InteractiveScene(scene_cfg)
+    # Play the simulator
+    sim.reset()
+    # Now we are ready!
+    print("[INFO]: Setup complete...")
+    # Run the simulator
+    run_simulator(
+        sim,
+        scene,
+        joint_names=robot_platform.joint_names,
+    )
+
+
+if __name__ == "__main__":
+    # run the main function
+    main()
+    # close sim app
+    simulation_app.close()
+
+'''
+python scripts/csv_to_npz.py --input_file /home/lsn/Datasets/bones-seed/g1/csv/210531/jump_and_land_heavy_001__A001_M.csv --input_fps 120 --bones_seed_g1_csv \
+        --output_name ./motions/jump_and_land_heavy_001__A001_M --output_fps 50
+'''

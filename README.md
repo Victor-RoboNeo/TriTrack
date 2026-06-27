@@ -1,0 +1,194 @@
+# AnyBody: Whole-Body Humanoid Tracking from Arbitrary Keypoint Subsets
+
+[![IsaacSim](https://img.shields.io/badge/IsaacSim-4.5.0-silver.svg)](https://docs.omniverse.nvidia.com/isaacsim/latest/overview.html)
+[![Isaac Lab](https://img.shields.io/badge/IsaacLab-2.1.0-silver)](https://isaac-sim.github.io/IsaacLab)
+[![Python](https://img.shields.io/badge/python-3.10-blue.svg)](https://docs.python.org/3/whatsnew/3.10.html)
+[![Linux platform](https://img.shields.io/badge/platform-linux--64-orange.svg)](https://releases.ubuntu.com/20.04/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://opensource.org/license/apache-2-0)
+
+[[Website]](https://hazel-hammer.github.io/anybody-project-page/) 
+
+## Overview
+
+**AnyBody** is a training framework for whole-body humanoid motion tracking from sparse, partial keypoint observations. Rather than requiring a fixed sensor configuration, AnyBody trains a policy that can track from *any subset* of body keypoints — enabling the same model to generalize across VR headsets, wrist-worn IMUs, camera-based pose detectors, or any combination thereof.
+
+The training pipeline has four stages:
+
+1. **GMT (teacher)** — A privileged teacher tracker is trained with full state via PPO on a large multi-source [motion dataset](https://bones.studio/datasets).
+2. **Latent bottleneck (Stage 1)** — The teacher is distilled online into a deterministic encoder–decoder student. The decoder D(z, proprio) → joint commands becomes a reusable frozen motor prior for subsequent stages.
+3. **Keypoint encoder (Stage 2)** — A self-attention transformer over per-keypoint tokens is distilled in *latent space* against the frozen Stage 1 encoder. A 3-phase masking curriculum progressively masks keypoints from fully visible down to sparse semantic subsets (torso, wrists, ankles).
+4. **Latent-space RL (Stage 3)** — PPO fine-tunes the latent action space with the decoder frozen as a motor prior. Reward is world-frame position accuracy over *visible* keypoints. Downstream tasks include omnidirectional locomotion, in-air writing, and obstacle-reach.
+
+## Installation
+
+Install Isaac Lab v2.1.0 by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html). We recommend the conda installation.
+
+```bash
+# create virtual environment
+conda create -n isaaclab python=3.10 -y
+conda activate isaaclab
+pip install --upgrade pip
+
+# install PyTorch
+pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+
+# install IsaacSim 4.5
+pip install "isaacsim[all,extscache]==4.5.0" --extra-index-url https://pypi.nvidia.com
+isaacsim  # verify
+
+# install Isaac Lab v2.1.0
+git clone https://github.com/isaac-sim/IsaacLab.git
+cd IsaacLab
+git fetch --all && git checkout v2.1.0
+./isaaclab.sh --install
+./isaaclab.sh -p scripts/tutorials/00_sim/create_empty.py  # verify
+```
+
+Clone this repository **outside** the `IsaacLab` directory:
+
+```bash
+git clone https://github.com/hazel-hammer/Anybody.git
+cd Anybody
+```
+
+Install the environment and algorithm libraries:
+
+```bash
+pip install -e source/whole_body_tracking
+pip install -e source/rsl_rl
+```
+
+## Data Preparation
+
+Motion data must be preprocessed into `.npz` format before training. We first download human motions from [Bones Studio's website](https://bones.studio/datasets), then retarget these motions into robot reference trajectories. We follow the same retargeting convention as [Unitree's LAFAN1 dataset](https://huggingface.co/datasets/lvhaidong/LAFAN1_Retargeting_Dataset).
+
+**Convert a single motion:**
+```bash
+python scripts/csv_to_npz.py --input_file {motion}.csv --input_fps 30 --output_name {motion} --headless
+```
+
+**Batch convert a directory:**
+```bash
+python scripts/batch_csv_to_npz.py --input_dir {motion_dir} --input_fps 30 --output_dir {output_dir} --headless
+```
+
+**Replay a motion to verify:**
+```bash
+python scripts/replay_npz.py --motion_file {motion_file.npz}
+```
+
+
+## Training
+
+Training scripts are in `run/train/`. Run the stages in order, setting motion paths and checkpoint paths inside each script.
+
+### Stage 0 — GMT Teacher
+
+```bash
+bash run/train/GMT/run_mosaic_gmt.sh
+```
+
+Checkpoints are saved to `logs/rsl_rl/g1_flat_mosaic_hybrid/<timestamp>_<run_name>/`.
+
+### Stage 1 — Latent Bottleneck (MUSE-Joint)
+
+```bash
+bash run/train/MUSE/run_muse_transformer_distillation.sh
+```
+
+Set `TEACHER_CHECKPOINT` to the GMT `.pt` path before running.
+
+### Stage 2 — Keypoint Encoder Distillation (MUSE-Kp)
+
+Distills a keypoint transformer into latent space against the frozen Stage 1 encoder:
+
+```bash
+bash run/train/MUSE/run_muse_kp_latent_distillation.sh
+```
+
+Set `TEACHER_CHECKPOINT` to the Stage 1 `.pt` path (used to initialize the frozen decoder, frozen JC encoder, and KP encoder warmstart).
+
+### Stage 3 — Latent-Space RL Fine-tuning
+
+Fine-tunes the keypoint encoder via PPO with the decoder frozen as a motor prior:
+
+```bash
+# Locomotion / general
+bash run/train/MUSE/run_muse_kp_latent_rl.sh
+
+# Writing task
+bash run/train/MUSE/run_muse_kp_latent_rl_writing.sh
+
+# Obstacle-reach task
+bash run/train/MUSE/run_muse_kp_latent_rl_obstacle_reach.sh
+```
+
+Set `ENCODER_DECODER_WARMSTART` to the Stage 2 `.pt` path. The adapter type (default: `full_ft`) can be changed via the `ADAPTER` env var (`lora` or `residual`).
+
+**Multi-GPU training** is supported via `torchrun`:
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/rsl_rl/train.py \
+    --task=<task_id> --distributed --num_envs=4096 --motion <motion_dir> --headless
+```
+
+## Evaluation
+
+```bash
+# Visualize a trained policy
+python scripts/rsl_rl/play.py \
+    --task=<task_id> \
+    --num_envs=1 \
+    --load_run=<timestamp_run_name> \
+    --checkpoint=model_<N>.pt \
+    --video --video_length=200 --headless
+```
+
+See scripts under `run/test/` for per-stage evaluation recipes.
+
+## Repo Structure
+
+```
+AnyBody/
+├── source/
+│   ├── whole_body_tracking/        # Isaac Lab task definitions and environment code
+│   │   └── whole_body_tracking/
+│   │       ├── tasks/
+│   │       │   ├── tracking/       # Main motion-tracking task (MDP, configs, rewards)
+│   │       │   │   ├── mdp/        # Atomic MDP functions (commands, rewards, obs, events)
+│   │       │   │   ├── config/g1/  # G1-specific env + agent configs
+│   │       │   │   └── tracking_env_cfg.py
+│   │       │   └── vr_tracking/    # VR teleoperation task variant
+│   │       ├── robots/             # Robot-specific actuator/joint configs (G1, SMPL)
+│   │       ├── collection/         # Expert trajectory collection utilities
+│   │       ├── distillation/       # Distillation model wrappers
+│   │       ├── motion_tools/       # Motion resampling utilities
+│   │       └── synth/              # Synthetic motion generation (writing task)
+│   └── rsl_rl/                     # Modified rsl_rl with AnyBody algorithms and modules
+│       └── rsl_rl/
+│           ├── algorithms/         # PPO, distillation, latent-RL training loops
+│           ├── modules/            # Encoder/decoder architectures (PULSE, MUSE-Kp, latent RL)
+│           ├── networks/           # Shared network building blocks (transformer, encoder, etc.)
+│           ├── runners/            # On-policy runner variants
+│           └── storage/            # Rollout storage
+├── scripts/
+│   ├── rsl_rl/                     # train.py and play.py entry points
+│   ├── csv_to_npz.py               # Single-motion preprocessing
+│   ├── batch_csv_to_npz.py         # Batch preprocessing
+│   ├── replay_npz.py               # Motion replay/visualization
+│   └── ...                         # Dataset analysis, statistics, synth tools
+└── run/
+    ├── train/
+    │   ├── GMT/                    # Stage 0: teacher training scripts
+    │   ├── PULSE/                  # Stage 1: latent bottleneck distillation scripts
+    │   └── MUSE/                   # Stages 2–3: KP encoder distillation + latent RL scripts
+    └── test/                       # Evaluation and visualization scripts
+```
+
+## Acknowledgements
+
+This project builds on the following open-source works:
+
+- **[MOSAIC](https://github.com/BAAI-Humanoid/MOSAIC)** (BAAI-Humanoid) — the base training infrastructure and the GMT teacher that AnyBody extends
+- **[Isaac Lab](https://github.com/isaac-sim/IsaacLab)** — simulation framework
+- **[Isaac Sim](https://docs.omniverse.nvidia.com/isaacsim/latest/overview.html)** — physics engine
+- **[rsl_rl](https://github.com/leggedrobotics/rsl_rl)** — RL training library (modified and extended)
