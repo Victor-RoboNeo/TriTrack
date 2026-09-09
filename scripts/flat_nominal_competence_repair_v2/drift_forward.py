@@ -40,8 +40,9 @@ from flat_nominal_competence_repair_v2.eval_ncr import _apply_eval_motion, _disa
 
 
 def main():
-    z = np.load(args_cli.obs_npz)
+    z = np.load(args_cli.obs_npz, allow_pickle=True)
     obs_all = np.asarray(z["obs"], dtype=np.float32)
+    traj_ids = np.array(z["traj_id"]).reshape(-1) if "traj_id" in z.files else np.array(["unk"] * obs_all.shape[0])
     n = int(obs_all.shape[0])
     env_cfg = parse_env_cfg(TASK, device=args_cli.device, num_envs=1, use_fabric=True)
     _apply_eval_motion(env_cfg, str(CLIP_LOCO), start_frame=10)
@@ -86,6 +87,20 @@ def main():
             "D_final_latent": {"mean": float(dz.mean()), "median": float(np.median(dz)), "p95": float(np.percentile(dz, 95)), "max": float(dz.max())},
             "D_gphi": {"mean": float(dg.mean()), "median": float(np.median(dg)), "p95": float(np.percentile(dg, 95)), "max": float(dg.max())},
             "D_action": {"mean": float(da.mean()), "median": float(np.median(da)), "p95": float(np.percentile(da, 95)), "max": float(da.max())},
+        }
+        by_traj = {}
+        for i, tid in enumerate(traj_ids):
+            rec = by_traj.setdefault(str(tid), {"d_g": [], "d_a": [], "d_z": []})
+            rec["d_g"].append(float(dg[i]))
+            rec["d_a"].append(float(da[i]))
+            rec["d_z"].append(float(dz[i]))
+        summary[name]["by_traj"] = {
+            tid: {
+                "D_gphi_mean": float(np.mean(v["d_g"])),
+                "D_action_mean": float(np.mean(v["d_a"])),
+                "D_final_latent_mean": float(np.mean(v["d_z"])),
+            }
+            for tid, v in by_traj.items()
         }
     Path(args_cli.out_json).parent.mkdir(parents=True, exist_ok=True)
     Path(args_cli.out_json).write_text(json.dumps(summary, indent=2) + "\n")
