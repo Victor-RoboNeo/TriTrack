@@ -1423,3 +1423,740 @@ class G1PartialMaskedVAEDistillationTrackingEnvCfg(G1VAEDistillationTrackingEnvC
             ),
 
 '''
+
+
+@configclass
+class G1MUSEKpLatentRLKp5RoughTrackingEnvCfg(G1MUSEKpLatentRLKp5TrackingEnvCfg):
+    """KP5 latent-RL on COMPLEX TERRAIN (TriTrack sparse-intent robustness finetune).
+
+    Same frozen-interface latent RL as :class:`G1MUSEKpLatentRLKp5TrackingEnvCfg` (identical
+    750-D obs / rewards / mask curriculum — the sparse-intent contract is untouched), but the
+    ground is a mixed generator: rough noise, pyramid slopes, and low stairs. References were
+    recorded on flat ground, so heights stay modest (<=8 cm steps, <=~8.5 deg slopes) — the
+    point is blind-terrain robustness of the decoded whole-body skill, not parkour. Center
+    platforms are flat so motion-command resets stay valid.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        from isaaclab.terrains import (
+            HfInvertedPyramidSlopedTerrainCfg,
+            HfInvertedPyramidStairsTerrainCfg,
+            HfPyramidSlopedTerrainCfg,
+            HfPyramidStairsTerrainCfg,
+            HfRandomUniformTerrainCfg,
+            MeshPlaneTerrainCfg,
+            TerrainGeneratorCfg,
+        )
+
+        self.scene.terrain.terrain_generator = TerrainGeneratorCfg(
+            seed=42,
+            size=(8.0, 8.0),
+            border_width=20.0,
+            num_rows=10,
+            num_cols=10,
+            horizontal_scale=0.1,
+            vertical_scale=0.005,
+            sub_terrains={
+                "flat": MeshPlaneTerrainCfg(proportion=0.2),
+                "rough": HfRandomUniformTerrainCfg(
+                    proportion=0.3, noise_range=(0.02, 0.06), noise_step=0.01
+                ),
+                "slope": HfPyramidSlopedTerrainCfg(
+                    proportion=0.125, slope_range=(0.03, 0.15), platform_width=2.0
+                ),
+                "slope_inv": HfInvertedPyramidSlopedTerrainCfg(
+                    proportion=0.125, slope_range=(0.03, 0.15), platform_width=2.0
+                ),
+                "stairs": HfPyramidStairsTerrainCfg(
+                    proportion=0.125,
+                    step_height_range=(0.02, 0.08),
+                    step_width=0.4,
+                    platform_width=2.0,
+                ),
+                "stairs_inv": HfInvertedPyramidStairsTerrainCfg(
+                    proportion=0.125,
+                    step_height_range=(0.02, 0.08),
+                    step_width=0.4,
+                    platform_width=2.0,
+                ),
+            },
+        )
+
+
+# =====================================================================================
+# KP5 3-point curriculum latent-RL (VR torso + L/R wrist). Frozen encoder/decoder from
+# Stage-2; residual adapter trained from scratch. Actor obs stay 750-D (no height scan).
+# =====================================================================================
+
+_VR_THREE_POINT_MODE_PROBS = (0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)  # 8-mode spec: pin `vr`
+
+_TRITRACK_MOTION_GROUPS = {
+    # First substring match wins (stoop before loco so stoop_down is not a walk clip).
+    "stoop": ["stoop", "Stoop", "squat", "Squat", "crouch", "Crouch"],
+    "loco": [
+        "walk",
+        "Walk",
+        "jog",
+        "Jog",
+        "Loop_Forward",
+        "Loop_Backward",
+        "loop_forward",
+        "loop_backward",
+    ],
+}
+
+_TRITRACK_GROUP_RATIO_PHASES = (
+    {"loco": 0.70, "stoop": 0.10, "default": 0.20},  # 0..3000: walk first
+    {"loco": 0.45, "stoop": 0.20, "default": 0.35},  # 3000..8000
+    {"loco": 0.40, "stoop": 0.25, "default": 0.35},  # 8000+
+)
+
+
+@configclass
+class LatentRLKp5Curriculum3ptRewardsCfg:
+    """3-point loco-mani reward: split XY/Z POI, terrain-relative z, weak full-body prior.
+
+    Tuned against the rough latent-RL plateau (SR@5cm ~30%, vis err ~14 cm, POI std=0.3
+    saturating). Tighter XY kernel for centimetre tracking; z uses ankle-mean terrain
+    offset so stairs are not a fake height error and stoop still trains. Weak (0.1)
+    full-body reference keeps legs natural without LATENTRL_REF_W env-var coupling.
+    """
+
+    poi_xy = RewTerm(
+        func=mdp.motion_visible_kp_xy_error_exp_world,
+        weight=3.5,
+        params={"command_name": "motion", "std": 0.2},
+    )
+    poi_z = RewTerm(
+        func=mdp.motion_visible_kp_z_error_exp_world_terrain_rel,
+        weight=2.0,
+        params={"command_name": "motion", "std": 0.25},
+    )
+    poi_lin_vel = RewTerm(
+        func=mdp.motion_visible_kp_lin_vel_error_exp_world,
+        weight=2.0,
+        params={"command_name": "motion", "std": 1.0},
+    )
+    motion_global_anchor_pos = RewTerm(
+        func=mdp.motion_global_anchor_position_error_exp_terrain_rel,
+        weight=0.7,
+        params={"command_name": "motion", "std": 0.3},
+    )
+    motion_global_anchor_ori = RewTerm(
+        func=mdp.motion_global_anchor_orientation_error_exp,
+        weight=0.8,
+        params={"command_name": "motion", "std": 0.4},
+    )
+    motion_body_pos = RewTerm(
+        func=mdp.motion_relative_body_position_error_exp,
+        weight=0.1,
+        params={"command_name": "motion", "std": 0.3},
+    )
+    motion_body_ori = RewTerm(
+        func=mdp.motion_relative_body_orientation_error_exp,
+        weight=0.1,
+        params={"command_name": "motion", "std": 0.4},
+    )
+    motion_body_lin_vel = RewTerm(
+        func=mdp.motion_global_body_linear_velocity_error_exp,
+        weight=0.15,
+        params={"command_name": "motion", "std": 1.0},
+    )
+    motion_body_ang_vel = RewTerm(
+        func=mdp.motion_global_body_angular_velocity_error_exp,
+        weight=0.15,
+        params={"command_name": "motion", "std": 3.14},
+    )
+    undesired_contacts = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-0.05,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=[
+                    r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_wrist_yaw_link$)(?!right_wrist_yaw_link$).+$"
+                ],
+            ),
+            "threshold": 1.0,
+        },
+    )
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-1)
+    joint_limit = RewTerm(
+        func=mdp.joint_pos_limits,
+        weight=-10.0,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
+    )
+    joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
+    joint_torque = RewTerm(func=mdp.joint_torques_l2, weight=-1e-5)
+
+
+@configclass
+class LatentRLKp5Curriculum3ptCfg(CurriculumCfg):
+    """Pin VR 3-point mask, mix loco/stoop/dynamic clips, and climb mild terrain."""
+
+    keypoint_mask_mode = CurrTerm(
+        func=mdp.curriculums.keypoint_mask_mode_curriculum,
+        params={
+            "command_name": "motion",
+            "phase_until_learning_iterations": (None,),
+            "mask_phases": (
+                {
+                    "mode_probs": _VR_THREE_POINT_MODE_PROBS,
+                    "p_start": 1.0,
+                    "p_end": 1.0,
+                },
+            ),
+        },
+    )
+    motion_group_ratio = CurrTerm(
+        func=mdp.curriculums.motion_group_ratio_curriculum,
+        params={
+            "command_name": "motion",
+            "phase_until_learning_iterations": (3000, 8000, None),
+            "ratio_phases": _TRITRACK_GROUP_RATIO_PHASES,
+        },
+    )
+    terrain_levels = CurrTerm(
+        func=mdp.curriculums.terrain_levels_tracking,
+        params={"move_up_frac": 0.60, "move_down_frac": 0.25},
+    )
+
+
+@configclass
+class G1MUSEKpLatentRLKp5Curriculum3ptTrackingEnvCfg(G1MUSEKpLatentRLKp5TrackingEnvCfg):
+    """3-point curriculum latent-RL for real-world VR loco-mani.
+
+    Warmstart Stage-2 encoder/decoder via ``--encoder_decoder_warmstart`` (no rough-RL
+    ckpt). Residual ``g_φ`` + critic train from scratch. Actor stays sparse KP + proprio.
+    """
+
+    curriculum: LatentRLKp5Curriculum3ptCfg = LatentRLKp5Curriculum3ptCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards = LatentRLKp5Curriculum3ptRewardsCfg()
+        self.commands.motion.mask_mode_probs = _VR_THREE_POINT_MODE_PROBS
+        self.commands.motion.motion_groups = dict(_TRITRACK_MOTION_GROUPS)
+        self.commands.motion.motion_group_sampling_ratios = dict(_TRITRACK_GROUP_RATIO_PHASES[0])
+        self.terminations.anchor_pos.func = mdp.bad_anchor_pos_z_only_terrain_rel
+
+        from isaaclab.terrains import (
+            HfInvertedPyramidSlopedTerrainCfg,
+            HfInvertedPyramidStairsTerrainCfg,
+            HfPyramidSlopedTerrainCfg,
+            HfPyramidStairsTerrainCfg,
+            HfRandomUniformTerrainCfg,
+            MeshPlaneTerrainCfg,
+            TerrainGeneratorCfg,
+        )
+
+        self.scene.terrain.terrain_generator = TerrainGeneratorCfg(
+            seed=42,
+            size=(8.0, 8.0),
+            border_width=20.0,
+            num_rows=10,
+            num_cols=10,
+            horizontal_scale=0.1,
+            vertical_scale=0.005,
+            curriculum=True,
+            sub_terrains={
+                "flat": MeshPlaneTerrainCfg(proportion=0.45),
+                "slightly_rough": HfRandomUniformTerrainCfg(
+                    proportion=0.20, noise_range=(0.01, 0.03), noise_step=0.01
+                ),
+                "slope": HfPyramidSlopedTerrainCfg(
+                    proportion=0.10, slope_range=(0.02, 0.10), platform_width=2.0
+                ),
+                "slope_inv": HfInvertedPyramidSlopedTerrainCfg(
+                    proportion=0.10, slope_range=(0.02, 0.10), platform_width=2.0
+                ),
+                "stairs": HfPyramidStairsTerrainCfg(
+                    proportion=0.075,
+                    step_height_range=(0.02, 0.06),
+                    step_width=0.4,
+                    platform_width=2.0,
+                ),
+                "stairs_inv": HfInvertedPyramidStairsTerrainCfg(
+                    proportion=0.075,
+                    step_height_range=(0.02, 0.06),
+                    step_width=0.4,
+                    platform_width=2.0,
+                ),
+            },
+        )
+        self.scene.terrain.max_init_terrain_level = 2
+
+
+# =====================================================================================
+# Head-always + 0-2 wrists latent-RL (resume from healthy 3pt ckpt). Ankles stay off.
+# =====================================================================================
+
+_HEAD_HANDS_MODE_PROBS = mask_modes.MUSE_KP5_HEAD_HANDS_PROBS
+
+_LOCOMANI_MOTION_GROUPS = {
+    # First substring match wins: manip before loco so stoop/pick are not walk clips.
+    "manip": [
+        "pick",
+        "Pick",
+        "lift",
+        "Lift",
+        "grab",
+        "Grab",
+        "place",
+        "Place",
+        "stoop",
+        "Stoop",
+        "squat",
+        "Squat",
+        "crouch",
+        "Crouch",
+        "carry",
+        "Carry",
+        "reach",
+        "Reach",
+    ],
+    "loco": [
+        "walk",
+        "Walk",
+        "jog",
+        "Jog",
+        "Loop_Forward",
+        "Loop_Backward",
+        "loop_forward",
+        "loop_backward",
+    ],
+}
+
+# Absolute PPO-iteration bounds (resume continues from model_35000).
+_LOCOMANI_GROUP_RATIO_PHASES = (
+    {"loco": 0.35, "manip": 0.45, "default": 0.20},  # 35000..38000
+    {"loco": 0.25, "manip": 0.55, "default": 0.20},  # 38000..43000
+    {"loco": 0.20, "manip": 0.60, "default": 0.20},  # 43000+
+)
+
+
+@configclass
+class LatentRLKp5HeadHandsCfg(CurriculumCfg):
+    """Torso always visible; sample 0/1/2 wrists. Loco-mani clip mix + mild terrain."""
+
+    keypoint_mask_mode = CurrTerm(
+        func=mdp.curriculums.keypoint_mask_mode_curriculum,
+        params={
+            "command_name": "motion",
+            "phase_until_learning_iterations": (None,),
+            "mask_phases": (
+                {
+                    "mode_probs": _HEAD_HANDS_MODE_PROBS,
+                    "p_start": 1.0,
+                    "p_end": 1.0,
+                },
+            ),
+        },
+    )
+    motion_group_ratio = CurrTerm(
+        func=mdp.curriculums.motion_group_ratio_curriculum,
+        params={
+            "command_name": "motion",
+            "phase_until_learning_iterations": (38000, 43000, None),
+            "ratio_phases": _LOCOMANI_GROUP_RATIO_PHASES,
+        },
+    )
+    terrain_levels = CurrTerm(
+        func=mdp.curriculums.terrain_levels_tracking,
+        params={"move_up_frac": 0.60, "move_down_frac": 0.25},
+    )
+
+
+@configclass
+class G1MUSEKpLatentRLKp5HeadHandsLocomaniTrackingEnvCfg(
+    G1MUSEKpLatentRLKp5Curriculum3ptTrackingEnvCfg
+):
+    """Next latent-RL stage: headset/torso always on, 0-2 wrists, loco-mani clip bias.
+
+    Encoder still KP5 (ankles present but never unmasked). Resume a healthy 3pt
+    residual ckpt (e.g. model_35000); do not load the collapsed 39k+ weights.
+    """
+
+    curriculum: LatentRLKp5HeadHandsCfg = LatentRLKp5HeadHandsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.motion.mask_mode_spec = mask_modes.muse_kp5_head_hands_mode_spec()
+        self.commands.motion.mask_mode_probs = _HEAD_HANDS_MODE_PROBS
+        self.commands.motion.motion_groups = dict(_LOCOMANI_MOTION_GROUPS)
+        self.commands.motion.motion_group_sampling_ratios = dict(_LOCOMANI_GROUP_RATIO_PHASES[0])
+
+
+# =====================================================================================
+# HeadHands on rough-only terrain, loco+mani (no high-dynamic default), torso L2 penalty.
+# Resume model_50000 into a NEW experiment folder.
+# =====================================================================================
+
+_ROUGH_LOCOMANI_GROUP_RATIOS = {"loco": 0.40, "manip": 0.60}
+
+
+@configclass
+class LatentRLKp5HeadHandsRoughRewardsCfg(LatentRLKp5Curriculum3ptRewardsCfg):
+    """Same 3-pt tracking rewards plus a small unbounded torso position L2 penalty."""
+
+    torso_pos_l2 = RewTerm(
+        func=mdp.motion_torso_position_error_l2,
+        weight=-1.5,
+        params={"command_name": "motion", "body_name": "torso_link"},
+    )
+
+
+@configclass
+class LatentRLKp5HeadHandsRoughCfg(CurriculumCfg):
+    """Torso always on, 0-2 wrists; loco/mani only; terrain curriculum on rough tiles."""
+
+    keypoint_mask_mode = CurrTerm(
+        func=mdp.curriculums.keypoint_mask_mode_curriculum,
+        params={
+            "command_name": "motion",
+            "phase_until_learning_iterations": (None,),
+            "mask_phases": (
+                {
+                    "mode_probs": _HEAD_HANDS_MODE_PROBS,
+                    "p_start": 1.0,
+                    "p_end": 1.0,
+                },
+            ),
+        },
+    )
+    motion_group_ratio = CurrTerm(
+        func=mdp.curriculums.motion_group_ratio_curriculum,
+        params={
+            "command_name": "motion",
+            "phase_until_learning_iterations": (None,),
+            "ratio_phases": (_ROUGH_LOCOMANI_GROUP_RATIOS,),
+        },
+    )
+    terrain_levels = CurrTerm(
+        func=mdp.curriculums.terrain_levels_tracking,
+        params={"move_up_frac": 0.60, "move_down_frac": 0.25},
+    )
+
+
+@configclass
+class G1MUSEKpLatentRLKp5HeadHandsRoughLocomaniTrackingEnvCfg(
+    G1MUSEKpLatentRLKp5HeadHandsLocomaniTrackingEnvCfg
+):
+    """Rough-only HeadHands stage: no plane, no high-dynamic clips, torso L2 penalty."""
+
+    curriculum: LatentRLKp5HeadHandsRoughCfg = LatentRLKp5HeadHandsRoughCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards = LatentRLKp5HeadHandsRoughRewardsCfg()
+        self.commands.motion.motion_groups = dict(_LOCOMANI_MOTION_GROUPS)
+        self.commands.motion.motion_group_sampling_ratios = dict(_ROUGH_LOCOMANI_GROUP_RATIOS)
+
+        from isaaclab.terrains import (
+            HfInvertedPyramidSlopedTerrainCfg,
+            HfInvertedPyramidStairsTerrainCfg,
+            HfPyramidSlopedTerrainCfg,
+            HfPyramidStairsTerrainCfg,
+            HfRandomUniformTerrainCfg,
+            TerrainGeneratorCfg,
+        )
+
+        self.scene.terrain.terrain_generator = TerrainGeneratorCfg(
+            seed=42,
+            size=(8.0, 8.0),
+            border_width=20.0,
+            num_rows=10,
+            num_cols=10,
+            horizontal_scale=0.1,
+            vertical_scale=0.005,
+            curriculum=True,
+            sub_terrains={
+                "rough": HfRandomUniformTerrainCfg(
+                    proportion=0.70, noise_range=(0.02, 0.06), noise_step=0.01
+                ),
+                "slope": HfPyramidSlopedTerrainCfg(
+                    proportion=0.10, slope_range=(0.02, 0.10), platform_width=2.0
+                ),
+                "slope_inv": HfInvertedPyramidSlopedTerrainCfg(
+                    proportion=0.10, slope_range=(0.02, 0.10), platform_width=2.0
+                ),
+                "stairs": HfPyramidStairsTerrainCfg(
+                    proportion=0.05,
+                    step_height_range=(0.02, 0.06),
+                    step_width=0.4,
+                    platform_width=2.0,
+                ),
+                "stairs_inv": HfInvertedPyramidStairsTerrainCfg(
+                    proportion=0.05,
+                    step_height_range=(0.02, 0.06),
+                    step_width=0.4,
+                    platform_width=2.0,
+                ),
+            },
+        )
+        self.scene.terrain.max_init_terrain_level = 2
+
+
+# =====================================================================================
+# P2: targeted g_phi refinement on slope/steps. Resume model_50000.
+# Frozen: Mapper-B, Stage-2 encoder/decoder. Terrain mix is NOT pure-rough.
+# =====================================================================================
+
+_P2_MOTION_GROUPS = {
+    # First substring match wins.
+    "stoop": ["stoop", "Stoop", "squat", "Squat", "crouch", "Crouch", "pick", "Pick"],
+    "carry": ["lift_crate", "Lift_crate", "carry", "Carry", "lift", "Lift"],
+    "reach": ["reach", "Reach", "grab", "Grab"],
+    "loco": [
+        "walk",
+        "Walk",
+        "jog",
+        "Jog",
+        "Loop_Forward",
+        "Loop_Backward",
+        "loop_forward",
+        "loop_backward",
+        "turn",
+        "Turn",
+        "lateral",
+        "sideway",
+        "Sideway",
+    ],
+}
+_P2_GROUP_RATIOS = {"loco": 0.35, "stoop": 0.35, "reach": 0.15, "carry": 0.15}
+
+
+@configclass
+class LatentRLKp5HeadHandsP2RewardsCfg(LatentRLKp5Curriculum3ptRewardsCfg):
+    """Same POI / terrain-rel-z rewards; split torso ori so roll/pitch beat yaw.
+
+    Combined quat-ori is kept at weight 0 for logs. No extra position term —
+    the P1 loophole was leaning to chase XY, not missing position weight.
+    """
+
+    motion_global_anchor_ori = RewTerm(
+        func=mdp.motion_global_anchor_orientation_error_exp,
+        weight=0.0,
+        params={"command_name": "motion", "std": 0.4},
+    )
+    ori_roll = RewTerm(
+        func=mdp.motion_global_anchor_rpy_error_exp,
+        weight=1.4,
+        params={"command_name": "motion", "std": 0.4, "axis": "roll"},
+    )
+    ori_pitch = RewTerm(
+        func=mdp.motion_global_anchor_rpy_error_exp,
+        weight=1.4,
+        params={"command_name": "motion", "std": 0.4, "axis": "pitch"},
+    )
+    ori_yaw = RewTerm(
+        func=mdp.motion_global_anchor_rpy_error_exp,
+        weight=0.8,
+        params={"command_name": "motion", "std": 0.4, "axis": "yaw"},
+    )
+    diag_torso_pitch = RewTerm(
+        func=mdp.diag_torso_pitch_abs,
+        weight=0.0,
+        params={"command_name": "motion"},
+    )
+    diag_pelvis_h = RewTerm(
+        func=mdp.diag_pelvis_height_terrain_rel,
+        weight=0.0,
+        params={"command_name": "motion"},
+    )
+
+
+@configclass
+class LatentRLKp5HeadHandsP2Cfg(CurriculumCfg):
+    """Fixed HeadHands mask; fixed loco/stoop-heavy clip mix. No terrain-level climb."""
+
+    keypoint_mask_mode = CurrTerm(
+        func=mdp.curriculums.keypoint_mask_mode_curriculum,
+        params={
+            "command_name": "motion",
+            "phase_until_learning_iterations": (None,),
+            "mask_phases": (
+                {
+                    "mode_probs": _HEAD_HANDS_MODE_PROBS,
+                    "p_start": 1.0,
+                    "p_end": 1.0,
+                },
+            ),
+        },
+    )
+    motion_group_ratio = CurrTerm(
+        func=mdp.curriculums.motion_group_ratio_curriculum,
+        params={
+            "command_name": "motion",
+            "phase_until_learning_iterations": (None,),
+            "ratio_phases": (_P2_GROUP_RATIOS,),
+        },
+    )
+
+
+@configclass
+class G1MUSEKpLatentRLKp5HeadHandsP2TrackingEnvCfg(
+    G1MUSEKpLatentRLKp5HeadHandsLocomaniTrackingEnvCfg
+):
+    """P2 fine-tune: 20% flat / 20% light-rough / 30% slope / 30% steps.
+
+    Does not replace the HeadHands locomani or rough-only tasks. Actor obs stay
+    750-D; ankles never unmasked.
+    """
+
+    curriculum: LatentRLKp5HeadHandsP2Cfg = LatentRLKp5HeadHandsP2Cfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards = LatentRLKp5HeadHandsP2RewardsCfg()
+        self.commands.motion.motion_groups = dict(_P2_MOTION_GROUPS)
+        self.commands.motion.motion_group_sampling_ratios = dict(_P2_GROUP_RATIOS)
+
+        from isaaclab.terrains import (
+            HfInvertedPyramidSlopedTerrainCfg,
+            HfInvertedPyramidStairsTerrainCfg,
+            HfPyramidSlopedTerrainCfg,
+            HfPyramidStairsTerrainCfg,
+            HfRandomUniformTerrainCfg,
+            MeshPlaneTerrainCfg,
+            TerrainGeneratorCfg,
+        )
+
+        self.scene.terrain.terrain_generator = TerrainGeneratorCfg(
+            seed=42,
+            size=(8.0, 8.0),
+            border_width=20.0,
+            num_rows=8,
+            num_cols=8,
+            horizontal_scale=0.1,
+            vertical_scale=0.005,
+            curriculum=False,
+            sub_terrains={
+                "flat": MeshPlaneTerrainCfg(proportion=0.20),
+                "slightly_rough": HfRandomUniformTerrainCfg(
+                    proportion=0.20, noise_range=(0.01, 0.03), noise_step=0.01
+                ),
+                "slope": HfPyramidSlopedTerrainCfg(
+                    proportion=0.15, slope_range=(0.087, 0.176), platform_width=2.0
+                ),
+                "slope_inv": HfInvertedPyramidSlopedTerrainCfg(
+                    proportion=0.15, slope_range=(0.087, 0.176), platform_width=2.0
+                ),
+                "stairs": HfPyramidStairsTerrainCfg(
+                    proportion=0.15,
+                    step_height_range=(0.03, 0.08),
+                    step_width=0.4,
+                    platform_width=2.0,
+                ),
+                "stairs_inv": HfInvertedPyramidStairsTerrainCfg(
+                    proportion=0.15,
+                    step_height_range=(0.03, 0.08),
+                    step_width=0.4,
+                    platform_width=2.0,
+                ),
+            },
+        )
+        self.scene.terrain.max_init_terrain_level = None
+        if hasattr(self.curriculum, "terrain_levels"):
+            self.curriculum.terrain_levels = None
+
+
+@configclass
+class G1MUSEKpLatentRLKp5HeadHandsP2CObservationsCfg(G1MUSEKpLatentRLKp5ObservationsCfg):
+    """P2-C policy obs: inherited 750-D core + 187-D height scan LAST."""
+
+    @configclass
+    class PolicyCfg(G1MUSEKpLatentRLKp5ObservationsCfg.PolicyCfg):
+        height_scan = ObsTerm(
+            func=mdp.terrain_height_scan,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner"), "offset": 0.5, "clip_abs": 0.5},
+        )
+
+    policy: PolicyCfg = PolicyCfg()
+
+
+@configclass
+class G1MUSEKpLatentRLKp5HeadHandsP2CTrackingEnvCfg(
+    G1MUSEKpLatentRLKp5HeadHandsP2TrackingEnvCfg
+):
+    """P2-C: same mix/rewards as P2, plus root-yaw 17×11 height scan on the actor.
+
+    Critic dim is unchanged so ``model_50000`` critic loads. Actor is 750+187.
+    """
+
+    observations: G1MUSEKpLatentRLKp5HeadHandsP2CObservationsCfg = (
+        G1MUSEKpLatentRLKp5HeadHandsP2CObservationsCfg()
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        from isaaclab.sensors import RayCasterCfg
+        from isaaclab.sensors.ray_caster.patterns import GridPatternCfg
+
+        self.scene.height_scanner = RayCasterCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+            attach_yaw_only=True,
+            pattern_cfg=GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
+            debug_vis=False,
+            mesh_prim_paths=["/World/ground"],
+        )
+        self.scene.height_scanner.update_period = self.decimation * self.sim.dt
+
+
+# =====================================================================================
+# P2-R R1a: intent recovery on Loco only. Same Flat/Light/Slope/Steps mix as P2,
+# P1 canonical rewards, 750-D actor (no scan), torso-only HeadHands mask.
+# =====================================================================================
+
+_R1A_MASK_PROBS = (1.0, 0.0, 0.0, 0.0)
+_R1A_GROUP_RATIOS = {"loco": 1.0}
+
+
+@configclass
+class LatentRLKp5HeadHandsP2RLocoCfg(CurriculumCfg):
+    """Torso-only mask; loco clips only; no terrain-level climb."""
+
+    keypoint_mask_mode = CurrTerm(
+        func=mdp.curriculums.keypoint_mask_mode_curriculum,
+        params={
+            "command_name": "motion",
+            "phase_until_learning_iterations": (None,),
+            "mask_phases": (
+                {
+                    "mode_probs": _R1A_MASK_PROBS,
+                    "p_start": 1.0,
+                    "p_end": 1.0,
+                },
+            ),
+        },
+    )
+    motion_group_ratio = CurrTerm(
+        func=mdp.curriculums.motion_group_ratio_curriculum,
+        params={
+            "command_name": "motion",
+            "phase_until_learning_iterations": (None,),
+            "ratio_phases": (_R1A_GROUP_RATIOS,),
+        },
+    )
+
+
+@configclass
+class G1MUSEKpLatentRLKp5HeadHandsP2RLocoTrackingEnvCfg(
+    G1MUSEKpLatentRLKp5HeadHandsP2TrackingEnvCfg
+):
+    """R1a: P2 terrain mix, P1 rewards, loco-only clips, no height scan."""
+
+    curriculum: LatentRLKp5HeadHandsP2RLocoCfg = LatentRLKp5HeadHandsP2RLocoCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards = LatentRLKp5Curriculum3ptRewardsCfg()
+        self.commands.motion.motion_groups = {"loco": list(_P2_MOTION_GROUPS["loco"])}
+        self.commands.motion.motion_group_sampling_ratios = dict(_R1A_GROUP_RATIOS)
+        self.commands.motion.mask_mode_probs = _R1A_MASK_PROBS
+        if hasattr(self.curriculum, "terrain_levels"):
+            self.curriculum.terrain_levels = None
+
+

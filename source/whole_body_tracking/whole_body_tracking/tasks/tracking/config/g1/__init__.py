@@ -252,6 +252,79 @@ def _register_g1_tasks() -> None:
         },
     )
 
+    # KP5 latent-RL on COMPLEX TERRAIN (TriTrack): same frozen sparse-intent interface,
+    # mixed rough/slope/stairs ground for blind-terrain robustness of the decoded skill.
+    gym.register(
+        id="MUSE-Kp-LatentRL-Kp5-Rough-General-Tracking-G1-v0",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": flat_env_cfg.G1MUSEKpLatentRLKp5RoughTrackingEnvCfg,
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatMUSEKpLatentRLKp5RunnerCfg",
+        },
+    )
+
+    # KP5 3-point curriculum latent-RL: VR mask pinned, loco/stoop/dynamic mix, mild terrain.
+    gym.register(
+        id="MUSE-Kp-LatentRL-Kp5-Curriculum-3pt-G1-v0",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": flat_env_cfg.G1MUSEKpLatentRLKp5Curriculum3ptTrackingEnvCfg,
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatMUSEKpLatentRLKp5RunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="MUSE-Kp-LatentRL-Kp5-HeadHands-Locomani-G1-v0",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": flat_env_cfg.G1MUSEKpLatentRLKp5HeadHandsLocomaniTrackingEnvCfg,
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatMUSEKpLatentRLKp5RunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="MUSE-Kp-LatentRL-Kp5-HeadHands-Rough-Locomani-G1-v0",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": flat_env_cfg.G1MUSEKpLatentRLKp5HeadHandsRoughLocomaniTrackingEnvCfg,
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatMUSEKpLatentRLKp5RunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="MUSE-Kp-LatentRL-Kp5-HeadHands-P2-G1-v0",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": flat_env_cfg.G1MUSEKpLatentRLKp5HeadHandsP2TrackingEnvCfg,
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatMUSEKpLatentRLKp5RunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="MUSE-Kp-LatentRL-Kp5-HeadHands-P2C-G1-v0",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": flat_env_cfg.G1MUSEKpLatentRLKp5HeadHandsP2CTrackingEnvCfg,
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatMUSEKpLatentRLKp5RunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="MUSE-Kp-LatentRL-Kp5-HeadHands-P2R-Loco-G1-v0",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": flat_env_cfg.G1MUSEKpLatentRLKp5HeadHandsP2RLocoTrackingEnvCfg,
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatMUSEKpLatentRLKp5RunnerCfg",
+        },
+    )
+
     # KP5 latent-RL WRITING specialization: mask pinned right-wrist-only + reset-to-frame-0
     # (synth writing clips are valid only at frame 0). Train on the npz_synth_pool word pool.
     gym.register(

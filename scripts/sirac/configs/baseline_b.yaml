@@ -1,0 +1,19 @@
+name: B_realization_lbc
+baseline: B_realization_lbc
+description: >
+  Stage-2 nominal rollout supplies upper-body targets and the analytic 7-D
+  realization command. Frozen HTD student writes lower-body + waist.
+num_envs: 16
+seed: 42
+episode_length_s: 10.0
+headless: true
+use_frozen_lbc: true
+static_arms: false
+future_intent: false
+navigator_enabled: false
+governor_enabled: false
+command_clip: deploy
+student_history_frames: 2
+action_scale: 0.25
+default_pose: htd
+jit_path: null  # auto-search; DummyHoldPolicy if missing

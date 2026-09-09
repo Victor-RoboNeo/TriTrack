@@ -111,6 +111,8 @@ class MySceneCfg(InteractiveSceneCfg):
     contact_forces = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True, force_threshold=10.0, debug_vis=True
     )
+    # P2-C sets this to a RayCasterCfg. None → InteractiveScene skips it.
+    height_scanner = None
 
 
 ##

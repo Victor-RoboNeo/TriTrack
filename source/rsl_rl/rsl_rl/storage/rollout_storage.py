@@ -382,6 +382,7 @@ class RolloutStorage:
                         None,
                     ), None, rnd_state_batch, teacher_obs_batch, teacher_mu_batch, teacher_sigma_batch, ref_vel_estimator_obs_batch, motion_groups_batch
                 else:
+                    self._batch_idx = batch_idx
                     yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                         None,
                         None,

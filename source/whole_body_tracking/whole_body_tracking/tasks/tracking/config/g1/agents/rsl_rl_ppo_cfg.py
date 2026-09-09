@@ -610,6 +610,7 @@ class G1FlatMUSEKpLatentRLKp5RunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "g1_flat_muse_kp_latent_rl"
     empirical_normalization = True
     freeze_normalizer_on_resume = True
+    reset_noise_std_on_resume = False
 
     policy = RslRlLatentRLActorCriticCfg(
         class_name="LatentRLActorCritic",

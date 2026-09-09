@@ -196,6 +196,8 @@ def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.load_checkpoint = args_cli.checkpoint
     if args_cli.run_name is not None:
         agent_cfg.run_name = args_cli.run_name
+    if getattr(args_cli, "experiment_name", None):
+        agent_cfg.experiment_name = args_cli.experiment_name
     if hasattr(args_cli, "warmstart_itrs"):
         agent_cfg.warmstart_itrs = args_cli.warmstart_itrs
     if hasattr(args_cli, "teacher_decay_iters") and args_cli.teacher_decay_iters is not None:

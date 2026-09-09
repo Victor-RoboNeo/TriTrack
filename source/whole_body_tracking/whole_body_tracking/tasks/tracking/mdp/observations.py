@@ -720,3 +720,21 @@ def selected_keypoints_pos_w_heading(
         command.selected_keypoints_pos_w_heading.reshape(command.selected_keypoints_pos_w_heading.size(0), -1),
         "selected_keypoints_pos_w_heading",
     )
+
+
+def terrain_height_scan(
+    env: ManagerBasedEnv,
+    sensor_cfg,
+    offset: float = 0.5,
+    clip_abs: float = 0.5,
+) -> torch.Tensor:
+    """Root-yaw local height scan, clipped then scaled to ``[-1, 1]``.
+
+    Isaac ``height_scan`` is ``torso_z - hit_z - offset`` in the yaw-only sensor
+    frame (not world z). Clip to ``±clip_abs`` metres then divide by ``clip_abs``.
+    """
+    sensor = env.scene.sensors[sensor_cfg.name]
+    raw = sensor.data.pos_w[:, 2].unsqueeze(1) - sensor.data.ray_hits_w[..., 2] - offset
+    raw = torch.nan_to_num(raw, nan=0.0, posinf=clip_abs, neginf=-clip_abs)
+    raw = raw.clamp(-clip_abs, clip_abs)
+    return (raw / max(float(clip_abs), 1e-6)).reshape(env.num_envs, -1)

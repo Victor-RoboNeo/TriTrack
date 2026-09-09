@@ -120,6 +120,11 @@ parser.add_argument(
     default=3.0,
     help="Minimum duration (seconds) for motions to be converted. Motions shorter than this will be skipped. Default: 3.0",
 )
+parser.add_argument(
+    "--skip_existing",
+    action="store_true",
+    help="Skip CSV files whose output NPZ already exists.",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -310,6 +315,7 @@ def main():
     sim, scene = setup_sim_and_scene(robot_platform.cfg)
     durations: list[float] = []
     skipped_count = 0
+    skipped_existing = 0
     try:
         all_files_length = len(csv_files)
         for i, csv_path in enumerate(tqdm(csv_files, desc="Converting motions", unit="file")):
@@ -318,12 +324,16 @@ def main():
             output_name = f"{args_cli.output_prefix}_{relative_csv.stem}"
             output_npz_path = (output_dir / relative_csv).with_name(f"{output_name}.npz")
             output_npz_path.parent.mkdir(parents=True, exist_ok=True)
+            if args_cli.skip_existing and output_npz_path.is_file() and output_npz_path.stat().st_size > 0:
+                skipped_existing += 1
+                continue
             print(f"[INFO]: Converting {i+1}/{all_files_length}: {csv_path} -> {output_npz_path}")
             duration = process_one_file(sim, scene, str(csv_path), str(output_npz_path), output_name, robot_platform.joint_names)
             if duration is not None:
                 durations.append(duration)
             else:
                 skipped_count += 1
+        print(f"[INFO]: Skipped existing: {skipped_existing}")
         print(f"[INFO]: Skipped {skipped_count} motions (duration < {args_cli.min_duration}s)")
     finally:
         # Print statistics before closing simulator (simulation_app.close() may exit the program)

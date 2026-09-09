@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_error_magnitude
+from isaaclab.utils.math import euler_xyz_from_quat, quat_conjugate, quat_error_magnitude, quat_mul
 
 from whole_body_tracking.tasks.tracking.mdp.commands import MotionCommand
 
@@ -27,6 +27,48 @@ def motion_global_anchor_orientation_error_exp(env: ManagerBasedRLEnv, command_n
     command: MotionCommand = env.command_manager.get_term(command_name)
     error = quat_error_magnitude(command.anchor_quat_w, command.robot_anchor_quat_w) ** 2
     return torch.exp(-error / std**2)
+
+
+def _wrap_pi(x: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(torch.sin(x), torch.cos(x))
+
+
+def motion_global_anchor_rpy_error_exp(
+    env: ManagerBasedRLEnv, command_name: str, std: float, axis: str = "pitch"
+) -> torch.Tensor:
+    """Exp-kernel on a single Euler axis of the torso/anchor orientation error.
+
+    Rough-terrain loophole is forward lean (pitch) / roll, not yaw. Split the
+    old quat-magnitude term so roll/pitch can be up-weighted independently.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    q_err = quat_mul(quat_conjugate(command.anchor_quat_w), command.robot_anchor_quat_w)
+    roll, pitch, yaw = euler_xyz_from_quat(q_err)
+    axes = {"roll": _wrap_pi(roll), "pitch": _wrap_pi(pitch), "yaw": _wrap_pi(yaw)}
+    if axis not in axes:
+        raise ValueError(f"axis must be roll|pitch|yaw, got {axis!r}")
+    error = axes[axis] ** 2
+    return torch.exp(-error / std**2)
+
+
+def diag_torso_pitch_abs(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Logging-only: |pitch| of robot vs command torso (radians). Use weight=0."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    q_err = quat_mul(quat_conjugate(command.anchor_quat_w), command.robot_anchor_quat_w)
+    _, pitch, _ = euler_xyz_from_quat(q_err)
+    return _wrap_pi(pitch).abs()
+
+
+def diag_pelvis_height_terrain_rel(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Logging-only: robot root z minus ankle-mean z (terrain-relative pelvis height)."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    names = list(command.cfg.body_names)
+    idxs = [names.index(n) for n in _ANKLE_BODY_NAMES if n in names]
+    root_z = command.robot_anchor_pos_w[:, 2]
+    if not idxs:
+        return root_z
+    ankle_z = command.robot_body_pos_w[:, idxs, 2].mean(dim=-1)
+    return root_z - ankle_z
 
 
 def motion_relative_body_position_error_exp(
@@ -75,6 +117,95 @@ def motion_visible_kp_position_error_exp_world(
     denom = vis.sum(dim=-1).clamp_min(1.0)  # avoid div-by-zero on all-masked envs
     err = (per_body_sq_err * vis).sum(dim=-1) / denom  # [N], mean over visible
     return torch.exp(-err / std**2)
+
+
+_ANKLE_BODY_NAMES = ("left_ankle_roll_link", "right_ankle_roll_link")
+
+
+def _ankle_mean_z_offset(command: MotionCommand) -> torch.Tensor:
+    """Robot ankle-mean z minus reference ankle-mean z.
+
+    Flat-recorded clips sit at z≈0 while the robot on stairs/slopes is higher, so a raw
+    world-z POI error punishes terrain following. Subtracting this offset scores *posture*
+    height (torso/wrist vs feet) instead of absolute world height. Ankles stay in the KP5
+    body set even when the VR 3-point mask hides them.
+    """
+    names = list(command.cfg.body_names)
+    idxs = [names.index(n) for n in _ANKLE_BODY_NAMES if n in names]
+    n_env = command.body_pos_w.shape[0]
+    if not idxs:
+        return command.body_pos_w.new_zeros(n_env)
+    robot_z = command.robot_body_pos_w[:, idxs, 2].mean(dim=-1)
+    ref_z = command.body_pos_w[:, idxs, 2].mean(dim=-1)
+    return robot_z - ref_z
+
+
+def _visible_mean_sq(per_body: torch.Tensor, command: MotionCommand) -> torch.Tensor:
+    vis = getattr(command, "_env_body_mask", None)
+    if vis is None:
+        vis = torch.ones_like(per_body)
+    vis = vis.to(per_body.dtype)
+    denom = vis.sum(dim=-1).clamp_min(1.0)
+    return (per_body * vis).sum(dim=-1) / denom
+
+
+def motion_visible_kp_xy_error_exp_world(
+    env: ManagerBasedRLEnv, command_name: str, std: float
+) -> torch.Tensor:
+    """World-frame XY accuracy of visible keypoints (plan-view loco / reach)."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    diff_xy = command.body_pos_w[..., :2] - command.robot_body_pos_w[..., :2]
+    per_body = torch.sum(torch.square(diff_xy), dim=-1)
+    err = _visible_mean_sq(per_body, command)
+    return torch.exp(-err / std**2)
+
+
+def motion_visible_kp_z_error_exp_world_terrain_rel(
+    env: ManagerBasedRLEnv, command_name: str, std: float
+) -> torch.Tensor:
+    """Terrain-relative Z accuracy of visible keypoints.
+
+    ``diff_z`` is shifted by the ankle-mean offset so squat/stoop still trains height
+    change, while stairs do not look like a constant z failure vs a flat clip.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    offset = _ankle_mean_z_offset(command).unsqueeze(-1)
+    diff_z = (command.body_pos_w[..., 2] - command.robot_body_pos_w[..., 2]) + offset
+    err = _visible_mean_sq(torch.square(diff_z), command)
+    return torch.exp(-err / std**2)
+
+
+def motion_global_anchor_position_error_exp_terrain_rel(
+    env: ManagerBasedRLEnv, command_name: str, std: float
+) -> torch.Tensor:
+    """Global anchor pos with the same ankle-mean z offset as the terrain-rel POI z term."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    diff = command.anchor_pos_w - command.robot_anchor_pos_w
+    offset = _ankle_mean_z_offset(command)
+    adj = torch.stack((diff[:, 0], diff[:, 1], diff[:, 2] + offset), dim=-1)
+    error = torch.sum(torch.square(adj), dim=-1)
+    return torch.exp(-error / std**2)
+
+
+def motion_torso_position_error_l2(
+    env: ManagerBasedRLEnv, command_name: str, body_name: str = "torso_link"
+) -> torch.Tensor:
+    """Squared world-frame torso position error (terrain-relative z).
+
+    Unbounded L2 so large forward lean / drift keeps growing, unlike the saturating
+    exp kernels. Pair with a *small* negative RewTerm weight (e.g. -1.5): 10 cm →
+    0.015, 30 cm → 0.135, 50 cm → 0.375. Z is shifted by the ankle-mean offset so
+    standing on a bump is not a fake height error.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    names = list(command.cfg.body_names)
+    if body_name not in names:
+        return command.body_pos_w.new_zeros(command.body_pos_w.shape[0])
+    idx = names.index(body_name)
+    diff = command.body_pos_w[:, idx] - command.robot_body_pos_w[:, idx]
+    offset = _ankle_mean_z_offset(command)
+    adj = torch.stack((diff[:, 0], diff[:, 1], diff[:, 2] + offset), dim=-1)
+    return torch.sum(torch.square(adj), dim=-1)
 
 
 def motion_visible_kp_lin_vel_error_exp_world(

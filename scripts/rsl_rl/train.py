@@ -185,6 +185,7 @@ sys.argv = [a for a in sys.argv if not a.startswith("--/renderer/activeGpu=")]
 
 """Rest everything follows."""
 
+import copy
 import gymnasium as gym
 import os
 import random
@@ -215,6 +216,313 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+_EASY_SUBTERRAIN_NAMES = frozenset({"flat", "plane", "slightly_rough", "light_rough"})
+
+
+def _replay_subterrain_type_map(gen_cfg):
+    """Replay Isaac Lab TerrainGenerator cell types. ``terrain_types`` is the grid
+    *column*, not the named sub-terrain, and with ``curriculum=False`` each cell is
+    sampled independently — so column index cannot identify Flat/Light."""
+    names = list(gen_cfg.sub_terrains.keys())
+    proportions = np.array([float(gen_cfg.sub_terrains[k].proportion) for k in names], dtype=np.float64)
+    proportions = proportions / proportions.sum()
+    num_rows = int(gen_cfg.num_rows)
+    num_cols = int(gen_cfg.num_cols)
+    type_map = np.zeros((num_rows, num_cols), dtype=np.int64)
+    if bool(gen_cfg.curriculum):
+        cumsum = np.cumsum(proportions)
+        for col in range(num_cols):
+            sub_index = int(np.min(np.where(col / num_cols + 0.001 < cumsum)[0]))
+            type_map[:, col] = sub_index
+        return names, type_map
+    if gen_cfg.seed is None:
+        raise RuntimeError("terrain generator seed is required to replay random cell types")
+    rng = np.random.default_rng(int(gen_cfg.seed))
+    diff_lo, diff_hi = gen_cfg.difficulty_range
+    for index in range(num_rows * num_cols):
+        sub_row, sub_col = np.unravel_index(index, (num_rows, num_cols))
+        sub_index = int(rng.choice(len(proportions), p=proportions))
+        rng.uniform(float(diff_lo), float(diff_hi))
+        type_map[sub_row, sub_col] = sub_index
+    return names, type_map
+
+
+def _easy_env_mask(env) -> torch.Tensor:
+    unwrapped = env.unwrapped if hasattr(env, "unwrapped") else env
+    terrain = unwrapped.scene.terrain
+    gen_cfg = getattr(terrain.cfg, "terrain_generator", None)
+    if gen_cfg is None or not hasattr(terrain, "terrain_types") or not hasattr(terrain, "terrain_levels"):
+        raise RuntimeError("parent residual anchor needs a generated terrain with per-env row/col")
+    names, type_map = _replay_subterrain_type_map(gen_cfg)
+    easy_ids = {i for i, n in enumerate(names) if n in _EASY_SUBTERRAIN_NAMES}
+    if not easy_ids:
+        raise RuntimeError(f"no Flat/Light sub-terrains in {names}")
+    rows = terrain.terrain_levels.detach().long().cpu()
+    cols = terrain.terrain_types.detach().long().cpu()
+    rows = rows.clamp(0, type_map.shape[0] - 1)
+    cols = cols.clamp(0, type_map.shape[1] - 1)
+    cell_type = torch.from_numpy(type_map[rows.numpy(), cols.numpy()])
+    easy = torch.zeros(cell_type.numel(), dtype=torch.bool)
+    for i in easy_ids:
+        easy |= cell_type == i
+    counts = {names[i]: int((cell_type == i).sum().item()) for i in range(len(names))}
+    return easy.to(device=terrain.terrain_types.device), names, counts
+
+
+def _bind_parent_residual_anchor(runner, env, agent_cfg) -> None:
+    hard_coef = float(getattr(agent_cfg.algorithm, "parent_residual_anchor_coef", 0.0) or 0.0)
+    elastic_coef = float(getattr(agent_cfg.algorithm, "elastic_latent_coef", 0.0) or 0.0)
+    if hard_coef <= 0.0 and elastic_coef <= 0.0:
+        return
+    policy = runner.alg.policy
+    residual = getattr(policy, "residual_corrector", None)
+    if residual is None:
+        print("[WARN] parent/elastic prior requested but residual_corrector is None; skip")
+        return
+    parent = copy.deepcopy(residual)
+    parent.eval()
+    for p in parent.parameters():
+        p.requires_grad_(False)
+    parent.to(next(residual.parameters()).device)
+    object.__setattr__(policy, "parent_residual_corrector", parent)
+    runner.alg.parent_residual_anchor_coef = hard_coef
+    runner.alg.elastic_latent_coef = elastic_coef
+    for name in (
+        "elastic_damp_coef",
+        "elastic_theta_easy_deg",
+        "elastic_theta_hard_deg",
+        "elastic_k_easy",
+        "elastic_k_hard",
+    ):
+        if hasattr(agent_cfg.algorithm, name):
+            setattr(runner.alg, name, float(getattr(agent_cfg.algorithm, name)))
+    easy, names, counts = _easy_env_mask(env)
+    runner.alg.easy_env_mask = easy
+    if int(os.environ.get("RANK", "0")) == 0:
+        n = int(easy.numel())
+        n_easy = int(easy.sum().item())
+        clip = getattr(agent_cfg.algorithm, "clip_param", None)
+        dkl = getattr(agent_cfg.algorithm, "desired_kl", None)
+        if elastic_coef > 0.0:
+            print(
+                f"[P2-B] elastic latent TR  λs={elastic_coef} λd={runner.alg.elastic_damp_coef} "
+                f"θ_free easy/hard={runner.alg.elastic_theta_easy_deg}/{runner.alg.elastic_theta_hard_deg}deg "
+                f"k easy/hard={runner.alg.elastic_k_easy}/{runner.alg.elastic_k_hard} "
+                f"clip={clip} desired_kl={dkl}  (hard parent L2={hard_coef})"
+            )
+        else:
+            print(
+                f"[P2-A] frozen parent g_phi0 from resume ckpt; "
+                f"anchor coef={hard_coef} clip={clip} desired_kl={dkl}"
+            )
+        print(f"[P2] easy (Flat+Light) envs: {n_easy}/{n} ({100.0 * n_easy / max(n, 1):.1f}%)")
+        print(f"[P2] sub-terrain env counts: {counts}  names={names}")
+
+
+_P2C_FLAT = frozenset({"flat", "plane"})
+_P2C_LIGHT = frozenset({"slightly_rough", "light_rough"})
+_P2C_SLOPE = frozenset({"slope", "slope_inv"})
+_P2C_STEPS = frozenset({"stairs", "stairs_inv", "steps"})
+
+
+def _terrain_group_id(env) -> tuple[torch.Tensor, list[str], dict]:
+    """Per-env group: 0=flat, 1=light, 2=slope, 3=steps, -1=other."""
+    unwrapped = env.unwrapped if hasattr(env, "unwrapped") else env
+    terrain = unwrapped.scene.terrain
+    gen_cfg = getattr(terrain.cfg, "terrain_generator", None)
+    if gen_cfg is None or not hasattr(terrain, "terrain_types") or not hasattr(terrain, "terrain_levels"):
+        raise RuntimeError("P2-C terrain groups need a generated terrain with per-env row/col")
+    names, type_map = _replay_subterrain_type_map(gen_cfg)
+    name_to_group = {}
+    for i, n in enumerate(names):
+        if n in _P2C_FLAT:
+            name_to_group[i] = 0
+        elif n in _P2C_LIGHT:
+            name_to_group[i] = 1
+        elif n in _P2C_SLOPE:
+            name_to_group[i] = 2
+        elif n in _P2C_STEPS:
+            name_to_group[i] = 3
+        else:
+            name_to_group[i] = -1
+    rows = terrain.terrain_levels.detach().long().cpu()
+    cols = terrain.terrain_types.detach().long().cpu()
+    rows = rows.clamp(0, type_map.shape[0] - 1)
+    cols = cols.clamp(0, type_map.shape[1] - 1)
+    cell_type = torch.from_numpy(type_map[rows.numpy(), cols.numpy()])
+    gid = torch.full((cell_type.numel(),), -1, dtype=torch.long)
+    for sub_i, g in name_to_group.items():
+        gid[cell_type == sub_i] = g
+    counts = {names[i]: int((cell_type == i).sum().item()) for i in range(len(names))}
+    return gid.to(device=terrain.terrain_types.device), names, counts
+
+
+def _bind_p2c_terrain_residual(runner, env, agent_cfg) -> None:
+    policy = runner.alg.policy
+    scan_dim = int(getattr(policy, "terrain_scan_dim", 0) or 0)
+    if scan_dim <= 0 or getattr(policy, "terrain_residual", None) is None:
+        return
+    if getattr(policy, "residual_corrector", None) is not None:
+        for p in policy.residual_corrector.parameters():
+            p.requires_grad_(False)
+        policy.residual_corrector.eval()
+    policy.latent_log_std.requires_grad_(False)
+    trainable = [p for p in policy.parameters() if p.requires_grad]
+    lr = float(agent_cfg.algorithm.learning_rate)
+    import torch.optim as optim
+
+    runner.alg.optimizer = optim.Adam(trainable, lr=lr)
+    runner.alg._opt_synced_late_params = True
+    gid, names, counts = _terrain_group_id(env)
+    runner.alg.terrain_group_id = gid
+    if int(os.environ.get("RANK", "0")) == 0:
+        n_h = sum(p.numel() for p in policy.terrain_residual.parameters() if p.requires_grad)
+        n_c = sum(p.numel() for p in policy.critic.parameters() if p.requires_grad)
+        n_g = sum(
+            p.numel()
+            for p in policy.residual_corrector.parameters()
+            if p.requires_grad
+        ) if policy.residual_corrector is not None else 0
+        n_std = int(policy.latent_log_std.requires_grad)
+        n_all = sum(p.numel() for p in trainable)
+        print(
+            f"[P2-D] frozen Mapper-B / Stage-2 / g_phi,50000 / decoder; "
+            f"trainable h_eta={n_h} critic={n_c} total={n_all} "
+            f"(g_phi_trainable={n_g} log_std_trainable={n_std})"
+        )
+        print(
+            f"[P2-D] scan_dim={scan_dim} r_max={float(policy.terrain_r_max):.4f} "
+            f"gate={bool(getattr(policy, 'terrain_gate', None) is not None)} "
+            f"λ0={getattr(agent_cfg.algorithm, 'terrain_zero_coef', 0)} "
+            f"λc={getattr(agent_cfg.algorithm, 'terrain_calm_coef', 0)} "
+            f"clip={agent_cfg.algorithm.clip_param} desired_kl={agent_cfg.algorithm.desired_kl} lr={lr}"
+        )
+        n = int(gid.numel())
+        for i, lab in enumerate(("flat", "light", "slope", "steps")):
+            k = int((gid == i).sum().item())
+            print(f"[P2-D] {lab} envs: {k}/{n} ({100.0 * k / max(n, 1):.1f}%)")
+        print(f"[P2-D] sub-terrain env counts: {counts}  names={names}")
+        last = policy.terrain_residual.head[-1]
+        print(
+            f"[P2-D] zero-init head max|W|={float(last.weight.abs().max()):.1e} "
+            f"max|b|={float(last.bias.abs().max()):.1e}"
+        )
+        gate = getattr(policy, "terrain_gate", None)
+        if gate is not None:
+            import torch as _torch
+
+            with _torch.no_grad():
+                nscan = int(policy.terrain_scan_dim)
+                dev = next(policy.parameters()).device
+                z = _torch.zeros(1, nscan, device=dev)
+                a0 = float(gate(z)[0].item())
+                x = gate.design[:, 0]
+                slope = ((0.13 * x) / float(gate.clip_abs)).unsqueeze(0)
+                a_s = float(gate(slope)[0].item())
+                light = (0.02 * _torch.randn(1, nscan, device=dev)) / float(gate.clip_abs)
+                a_l = float(gate(light.clamp(-1, 1))[0].item())
+                step = z.clone()
+                step[0, nscan // 2 :] = 0.06 / float(gate.clip_abs)
+                a_t = float(gate(step)[0].item())
+            print(
+                f"[P2-D] synthetic gate α: H=0 → {a0:.4f}  light~2cm → {a_l:.3f}  "
+                f"slope 0.13 → {a_s:.3f}  step 6cm → {a_t:.3f}  (want α(0)=0, Flat/Light low, Slope/Steps high)"
+            )
+
+
+def _bind_p2r_intent_recovery(runner, env, agent_cfg) -> None:
+    policy = runner.alg.policy
+    if not bool(getattr(policy, "intent_recovery", False)):
+        return
+    if getattr(policy, "residual_corrector", None) is not None:
+        for p in policy.residual_corrector.parameters():
+            p.requires_grad_(False)
+        policy.residual_corrector.eval()
+    policy.latent_log_std.requires_grad_(False)
+    if getattr(policy, "muse", None) is not None:
+        for p in policy.muse.parameters():
+            p.requires_grad_(False)
+        policy.muse.eval()
+    trainable = [p for p in policy.parameters() if p.requires_grad]
+    lr = float(agent_cfg.algorithm.learning_rate)
+    import torch.optim as optim
+
+    runner.alg.optimizer = optim.Adam(trainable, lr=lr)
+    runner.alg._opt_synced_late_params = True
+    policy._recovery_obs_nrm = [runner.obs_normalizer]
+    gid, names, counts = _terrain_group_id(env)
+    runner.alg.terrain_group_id = gid
+    if int(os.environ.get("RANK", "0")) == 0:
+        n_r = sum(p.numel() for p in policy.intent_recovery_net.parameters() if p.requires_grad)
+        n_c = sum(p.numel() for p in policy.critic.parameters() if p.requires_grad)
+        n_g = (
+            sum(p.numel() for p in policy.residual_corrector.parameters() if p.requires_grad)
+            if policy.residual_corrector is not None
+            else 0
+        )
+        n_all = sum(p.numel() for p in trainable)
+        last = policy.intent_recovery_net.net[-1]
+        print(
+            f"[P2-R R1a] frozen Mapper-B / Stage-2 / g_phi,50000 / decoder / log_std; "
+            f"trainable r_eta={n_r} critic={n_c} total={n_all} "
+            f"(g_phi_trainable={n_g} log_std_trainable={int(policy.latent_log_std.requires_grad)})"
+        )
+        nrm = policy._recovery_obs_nrm[0] if getattr(policy, "_recovery_obs_nrm", None) else None
+        nrm_dim = int(getattr(nrm, "_mean").reshape(-1).shape[0]) if nrm is not None else 0
+        print(
+            f"[P2-R R1a] no terrain obs  R=R_E  r_max={float(policy.intent_recovery_r_max):.4f} "
+            f"gate={policy.intent_recovery_gate.extra_repr()} "
+            f"clip={agent_cfg.algorithm.clip_param} desired_kl={agent_cfg.algorithm.desired_kl} lr={lr} "
+            f"E=denorm_metres (normalizer_dim={nrm_dim}) "
+            f"λ_p={float(getattr(agent_cfg.algorithm, 'recovery_progress_coef', 0.0)):.4f} "
+            f"c_p={float(getattr(agent_cfg.algorithm, 'recovery_progress_clip', 1.0)):.2f} "
+            f"λ_rel={float(getattr(agent_cfg.algorithm, 'recovery_release_coef', 0.0)):.4f} "
+            f"(done⇒r_prog=0)"
+        )
+        print(
+            f"[P2-R R1a] zero-init last |W|={float(last.weight.abs().max()):.1e} "
+            f"|b|={float(last.bias.abs().max()):.1e}"
+        )
+        n = int(gid.numel())
+        for i, lab in enumerate(("flat", "light", "slope", "steps")):
+            k = int((gid == i).sum().item())
+            print(f"[P2-R R1a] {lab} envs: {k}/{n} ({100.0 * k / max(n, 1):.1f}%)")
+        print(f"[P2-R R1a] sub-terrain env counts: {counts}  names={names}")
+
+
+def _bind_icr_interaction_recovery(runner, env, agent_cfg) -> None:
+    policy = runner.alg.policy
+    if not bool(getattr(policy, "interaction_recovery", False)):
+        return
+    if getattr(policy, "residual_corrector", None) is not None:
+        for p in policy.residual_corrector.parameters():
+            p.requires_grad_(False)
+        policy.residual_corrector.eval()
+    policy.latent_log_std.requires_grad_(False)
+    if getattr(policy, "muse", None) is not None:
+        for p in policy.muse.parameters():
+            p.requires_grad_(False)
+        policy.muse.eval()
+    trainable = [p for p in policy.parameters() if p.requires_grad]
+    lr = float(agent_cfg.algorithm.learning_rate)
+    import torch.optim as optim
+
+    runner.alg.optimizer = optim.Adam(trainable, lr=lr)
+    runner.alg._opt_synced_late_params = True
+    policy._recovery_obs_nrm = [runner.obs_normalizer]
+    if int(os.environ.get("RANK", "0")) == 0:
+        n_a = sum(p.numel() for p in policy.interaction_net.parameters() if p.requires_grad)
+        n_c = sum(p.numel() for p in policy.critic.parameters() if p.requires_grad)
+        n_all = sum(p.numel() for p in trainable)
+        print(
+            f"[ICR] frozen Mapper-B / Stage-2 / g_phi / decoder / log_std; "
+            f"trainable adapter={n_a} critic={n_c} total={n_all} "
+            f"{policy.interaction_net.extra_repr()} "
+            f"λ_p={float(getattr(agent_cfg.algorithm, 'recovery_progress_coef', 0.0)):.4f} "
+            f"λ_z={float(getattr(agent_cfg.algorithm, 'interaction_dz_coef', 0.0)):.4f} "
+            f"lr={lr} (no terrain obs, no gate)"
+        )
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -502,11 +810,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         else:
             resume_path = os.path.abspath(resume_path)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+        p2c = int(getattr(agent_cfg.policy, "terrain_scan_dim", 0) or 0) > 0
+        p2r = bool(getattr(agent_cfg.policy, "intent_recovery", False))
+        icr = bool(getattr(agent_cfg.policy, "interaction_recovery", False))
         if getattr(args_cli, "test_prior_quality", False):
             runner.load(resume_path, load_optimizer=False, load_critic=False)
         else:
-            # load policy only; do not load optimizer so current config LR is used
-            runner.load(resume_path, load_optimizer=True)  # TODO: check if this is correct
+            # P2-D / P2-R / ICR: new residual params — always a fresh Adam on trainable tensors.
+            runner.load(resume_path, load_optimizer=not (p2c or p2r or icr))
+            lr = float(agent_cfg.algorithm.learning_rate)
+            opt = getattr(runner.alg, "optimizer", None)
+            if opt is not None:
+                for g in opt.param_groups:
+                    g["lr"] = lr
+                print(f"[INFO]: Set optimizer lr={lr} after resume")
+
+        _bind_parent_residual_anchor(runner, env, agent_cfg)
+        _bind_p2c_terrain_residual(runner, env, agent_cfg)
+        _bind_p2r_intent_recovery(runner, env, agent_cfg)
+        _bind_icr_interaction_recovery(runner, env, agent_cfg)
 
     if int(os.environ.get("RANK", "0")) == 0:
         # dump the configuration into log-directory

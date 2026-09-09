@@ -2067,8 +2067,11 @@ class MultiMotionCommand(CommandTerm):
                 group_env_splits[group_name] = env_ids[start_idx:start_idx + n_envs_group]
                 start_idx += n_envs_group
 
-        print(f"[MultiMotionCommand] Assigning {n_envs} environments with ratios: "
-              f"{', '.join([f'{k}={len(v)}/{n_envs}' for k, v in group_env_splits.items()])}")
+        if n_envs == self.num_envs:
+            print(
+                f"[MultiMotionCommand] Assigning {n_envs} environments with ratios: "
+                f"{', '.join([f'{k}={len(v)}/{n_envs}' for k, v in group_env_splits.items()])}"
+            )
 
         # Sample motions for each group
         for group_name, group_env_ids in group_env_splits.items():

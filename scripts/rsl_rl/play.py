@@ -177,6 +177,28 @@ parser.add_argument(
     "full-body Cartesian tracking on any tracking task.",
 )
 parser.add_argument(
+    "--force_rough_terrain",
+    action="store_true",
+    default=False,
+    help="Replace the scene ground with a 1x1 random-uniform rough tile (3–6 cm, in-distribution "
+    "with HeadHands stairs/rough) so play/video is guaranteed not to spawn on a plane. "
+    "Also disables the terrain-level curriculum.",
+)
+parser.add_argument(
+    "--future_mode",
+    type=str,
+    default="oracle",
+    choices=("oracle", "hold", "mapper"),
+    help="KP5 future slots: oracle=GT (default), hold=copy current target, mapper=causal "
+    "FutureIntentMapper from K_<=t only. Identical clips/seed/mask otherwise.",
+)
+parser.add_argument(
+    "--mapper_path",
+    type=str,
+    default="/data/home/chenxiangyu/victor/TriTrack/runs/mapper_b_intent72/mapper_best.pt",
+    help="[future_mode=mapper] Path to mapper_best.pt.",
+)
+parser.add_argument(
     "--poi5_dot_vis",
     action="store_true",
     default=False,
@@ -935,6 +957,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
+    if bool(getattr(args_cli, "force_rough_terrain", False)):
+        from isaaclab.terrains import HfRandomUniformTerrainCfg, TerrainGeneratorCfg
+
+        env_cfg.scene.terrain.terrain_type = "generator"
+        env_cfg.scene.terrain.terrain_generator = TerrainGeneratorCfg(
+            seed=42,
+            size=(8.0, 8.0),
+            border_width=20.0,
+            num_rows=1,
+            num_cols=1,
+            horizontal_scale=0.1,
+            vertical_scale=0.005,
+            curriculum=False,
+            sub_terrains={
+                "rough": HfRandomUniformTerrainCfg(
+                    proportion=1.0,
+                    noise_range=(0.03, 0.06),
+                    noise_step=0.01,
+                ),
+            },
+        )
+        env_cfg.scene.terrain.max_init_terrain_level = None
+        if hasattr(env_cfg, "curriculum") and env_cfg.curriculum is not None:
+            if hasattr(env_cfg.curriculum, "terrain_levels"):
+                env_cfg.curriculum.terrain_levels = None
+                print("[play] --force_rough_terrain: disabled curriculum term: terrain_levels.")
+        print("[play] --force_rough_terrain: 1x1 HfRandomUniform tile, noise 3–6 cm.")
+
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
@@ -1008,6 +1058,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # actor-critic's obstacle strip + the corrector's obstacle head. Must be
                 # restored or play rebuilds the policy without them (encoder dim mismatch).
                 "obstacle_feat_dim", "obstacle_n",
+                "terrain_scan_dim", "terrain_r_max", "terrain_scan_zero",
             )
             _restored = {}
             for _k in _latent_rl_arch_keys:
@@ -1614,6 +1665,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             videos_subdir = videos_subdir_base
         video_folder_path = os.path.join(log_dir, videos_subdir, video_folder_name)
         _rec_prefix = "rl-video"
+        _fm = str(getattr(args_cli, "future_mode", "oracle") or "oracle")
+        if _fm != "oracle":
+            _rec_prefix = f"rl-video_{_fm}"
         if fixed_mask_video_slug:
             _rec_prefix = f"rl-video_mask_{fixed_mask_video_slug}"
         elif fixed_vr_video_slug:
@@ -1804,6 +1858,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
+    future_mode = str(getattr(args_cli, "future_mode", "oracle") or "oracle")
+    future_injector = None
+    if future_mode != "oracle":
+        from causal_future import CausalFutureInjector, DEFAULT_MAPPER
+
+        future_injector = CausalFutureInjector(
+            getattr(args_cli, "mapper_path", None) or DEFAULT_MAPPER,
+            device=env.unwrapped.device,
+        )
+        print(f"[Play] causal future_mode={future_mode} (zero future leakage into policy obs).", flush=True)
+
     # Prior rollout (PULSE only): R(proprio) → z → decode (encoder bypassed)
     use_prior_sample = args_cli.prior_sample
     prior_latent_sampling = not bool(getattr(args_cli, "no_prior_latent_sampling", False))
@@ -1970,6 +2035,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 else:
                     # Standard inference without velocity estimator
                     obs, _ = env.get_observations()
+                    if future_injector is not None:
+                        obs = future_injector.patch_policy_obs(obs, env, future_mode)
                     if use_prior_sample and prior_metrics_ready:
                         norm = ppo_runner.obs_normalizer(obs)
                         st = ppo_runner.alg.policy.act_prior_sample_with_stats(

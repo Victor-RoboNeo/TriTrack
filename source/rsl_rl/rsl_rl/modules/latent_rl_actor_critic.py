@@ -37,6 +37,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 import copy
+import math
 
 import torch
 import torch.nn as nn
@@ -120,6 +121,36 @@ class LatentRLActorCritic(nn.Module):
         # corrector as per-box tokens. 0 (default) -> no obstacle (writing/general unchanged).
         obstacle_feat_dim: int = 0,
         obstacle_n: int = 0,
+        # --- P2-C terrain residual (height scan LAST on policy obs) ---
+        terrain_scan_dim: int = 0,
+        terrain_r_max: float = 0.1763,
+        terrain_scan_zero: bool = False,
+        terrain_gate: bool = True,
+        terrain_gate_w_s: float = 1.0,
+        terrain_gate_w_r: float = 2.5,
+        terrain_gate_s0: float = 0.06,
+        terrain_gate_tau: float = 0.025,
+        terrain_gate_s_dead: float = 0.02,
+        terrain_scan_clip: float = 0.5,
+        # --- P2-R intent recovery (no terrain scan; last Linear zero-init) ---
+        intent_recovery: bool = False,
+        intent_recovery_r_max: float = 0.0875,
+        intent_recovery_r_off: float = 0.6,
+        intent_recovery_r_full: float = 2.0,
+        intent_recovery_persist_on: int = 3,
+        intent_recovery_persist_off: int = 3,
+        intent_recovery_q50_e: float = 0.046,
+        intent_recovery_q90_e: float = 0.130,
+        intent_recovery_q50_s: float = 0.041,
+        intent_recovery_q90_s: float = 0.241,
+        intent_recovery_aux_dim: int = 0,
+        intent_recovery_s_enabled: bool = False,
+        interaction_recovery: bool = False,
+        interaction_encoder: str = "mlp",
+        interaction_history_len: int = 16,
+        interaction_tangent: bool = True,
+        interaction_beta: float = 1.0,
+        interaction_r_max: float = 0.0875,
         **kwargs: Any,
     ):
         super().__init__()
@@ -150,6 +181,20 @@ class LatentRLActorCritic(nn.Module):
         _consumed_via_kwargs = {
             "residual_d_model", "residual_num_layers", "residual_nhead",
             "residual_ffn", "residual_last_layer_gain", "residual_alpha",
+            "latent_std_min", "latent_std_max",
+            "terrain_scan_dim", "terrain_r_max", "terrain_scan_zero",
+            "terrain_gate", "terrain_gate_w_s", "terrain_gate_w_r",
+            "terrain_gate_s0", "terrain_gate_tau", "terrain_gate_s_dead",
+            "terrain_scan_clip",
+            "intent_recovery", "intent_recovery_r_max", "intent_recovery_r_off",
+            "intent_recovery_r_full", "intent_recovery_persist_on",
+            "intent_recovery_persist_off", "intent_recovery_q50_e",
+            "intent_recovery_q90_e", "intent_recovery_q50_s",
+            "intent_recovery_q90_s", "intent_recovery_aux_dim",
+            "intent_recovery_s_enabled",
+            "interaction_recovery", "interaction_encoder", "interaction_history_len",
+            "interaction_tangent", "interaction_beta", "interaction_r_max",
+            "freeze_mode",
         }
         extra = sorted(set(kwargs) - set(_MUSE_KWARG_KEYS) - _consumed_via_kwargs)
         if extra:
@@ -163,13 +208,49 @@ class LatentRLActorCritic(nn.Module):
         muse_kwargs["deterministic_encoder"] = True
         muse_kwargs["latent_normalize"] = True
         muse_kwargs["freeze_mode"] = _ADAPTER_FREEZE_MODE[self.adapter]
-        # Obstacle obs (option C): the policy obs has the obstacle block appended LAST. The
-        # frozen encoder must see only its own [kp|mask|proprio] width, so build it on the
-        # stripped dim and slice the obstacle off at encode time (-> residual corrector).
+        # Trailing extras (option C obstacle, then P2-C height scan LAST). The frozen
+        # encoder must see only its own [kp|mask|proprio] width.
         self.obstacle_feat_dim = int(obstacle_feat_dim)
         self.obstacle_n = int(obstacle_n)
-        self._enc_obs_dim = int(num_actor_obs) - self.obstacle_feat_dim
+        self.terrain_scan_dim = int(terrain_scan_dim)
+        self.terrain_r_max = float(terrain_r_max)
+        self.terrain_scan_zero = bool(terrain_scan_zero)
+        self.terrain_gate_enabled = bool(terrain_gate)
+        self.terrain_gate_w_s = float(terrain_gate_w_s)
+        self.terrain_gate_w_r = float(terrain_gate_w_r)
+        self.terrain_gate_s0 = float(terrain_gate_s0)
+        self.terrain_gate_tau = float(terrain_gate_tau)
+        self.terrain_gate_s_dead = float(terrain_gate_s_dead)
+        self.terrain_scan_clip = float(terrain_scan_clip)
+        self.terrain_gate: nn.Module | None = None
+        self.intent_recovery = bool(intent_recovery)
+        self.intent_recovery_r_max = float(intent_recovery_r_max)
+        self.intent_recovery_aux_dim = int(intent_recovery_aux_dim)
+        self.intent_recovery_net: nn.Module | None = None
+        self.intent_recovery_gate: nn.Module | None = None
+        self.interaction_recovery = bool(interaction_recovery)
+        self.interaction_net: nn.Module | None = None
+        self._recovery_force_alpha: float | None = None
+        self._recovery_alpha_override: torch.Tensor | None = None
+        self._prev_e: torch.Tensor | None = None
+        self._last_recovery: dict | None = None
+        # List, not nn.Module: assigning the runner normalizer as an attribute
+        # would register it in state_dict and break eval load.
+        self._recovery_obs_nrm: list = []
+        self._enc_obs_dim = (
+            int(num_actor_obs)
+            - self.obstacle_feat_dim
+            - self.terrain_scan_dim
+            - self.intent_recovery_aux_dim
+        )
+        if self._enc_obs_dim <= 0:
+            raise ValueError(
+                f"encoder obs dim non-positive: num_actor_obs={num_actor_obs} "
+                f"obstacle={self.obstacle_feat_dim} scan={self.terrain_scan_dim} "
+                f"recovery_aux={self.intent_recovery_aux_dim}"
+            )
         self._obstacle_per_box = (self.obstacle_feat_dim // self.obstacle_n) if self.obstacle_n > 0 else 0
+        self.terrain_residual: nn.Module | None = None
         self.muse = LatentBottleneckMUSEKp(
             num_student_obs=self._enc_obs_dim,
             num_teacher_obs=int(num_teacher_obs),
@@ -226,11 +307,104 @@ class LatentRLActorCritic(nn.Module):
                 alpha=float(kwargs.get("residual_alpha", 1.0)),
             )
 
+        # P2-D: scan-only h_η + analytic α(H) with α(0)=0. Last Linear zero-init
+        # so π(0) = g_{φ,50000}. g_φ and latent_log_std frozen; only h_η + critic train.
+        if self.terrain_scan_dim > 0:
+            from rsl_rl.modules.terrain_residual import TerrainResidualMLP, TerrainSeverityGate
+
+            self.terrain_residual = TerrainResidualMLP(
+                scan_dim=self.terrain_scan_dim, latent_dim=self.latent_dim
+            )
+            if self.terrain_gate_enabled:
+                self.terrain_gate = TerrainSeverityGate(
+                    scan_dim=self.terrain_scan_dim,
+                    w_s=self.terrain_gate_w_s,
+                    w_r=self.terrain_gate_w_r,
+                    s0=self.terrain_gate_s0,
+                    tau=self.terrain_gate_tau,
+                    s_dead=self.terrain_gate_s_dead,
+                    clip_abs=self.terrain_scan_clip,
+                )
+            if self.residual_corrector is not None:
+                for p in self.residual_corrector.parameters():
+                    p.requires_grad_(False)
+                self.residual_corrector.eval()
+            last = self.terrain_residual.head[-1]
+            print(
+                f"[LatentRLActorCritic] P2-D gated residual scan_dim={self.terrain_scan_dim} "
+                f"r_max={self.terrain_r_max:.4f} gate={self.terrain_gate_enabled} "
+                f"last||W||={float(last.weight.abs().max()):.1e} (g_phi frozen, h_eta=h(H) only)"
+            )
+
         # ---- State-independent Gaussian over the latent (decision D1) ----
         init_latent_std = max(float(init_latent_std), 1.0e-6)
         self.latent_log_std = nn.Parameter(
             torch.log(init_latent_std * torch.ones(self.latent_dim))
         )
+        if self.terrain_scan_dim > 0:
+            self.latent_log_std.requires_grad_(False)
+
+        # P2-R: freeze the entire nominal stack (encoder, g_φ, decoder, log_std).
+        # Only r_η + critic train. Last Linear of r_η is zero so r≡0 at init.
+        if self.intent_recovery:
+            from rsl_rl.modules.intent_recovery import RecoveryResidualMLP, RecoveryRiskGate
+
+            if self.residual_corrector is not None:
+                for p in self.residual_corrector.parameters():
+                    p.requires_grad_(False)
+                self.residual_corrector.eval()
+            self.latent_log_std.requires_grad_(False)
+            enc = self.muse.transformer_encoder
+            prop_dim = int(enc.per_frame_proprio_dim) * int(enc.proprio_history_length)
+            self.intent_recovery_net = RecoveryResidualMLP(
+                proprio_dim=prop_dim, latent_dim=self.latent_dim
+            )
+            self.intent_recovery_gate = RecoveryRiskGate(
+                q50_e=float(intent_recovery_q50_e),
+                q90_e=float(intent_recovery_q90_e),
+                q50_s=float(intent_recovery_q50_s),
+                q90_s=float(intent_recovery_q90_s),
+                r_off=float(intent_recovery_r_off),
+                r_full=float(intent_recovery_r_full),
+                persist_on=int(intent_recovery_persist_on),
+                persist_off=int(intent_recovery_persist_off),
+                s_enabled=bool(intent_recovery_s_enabled),
+            )
+            last = self.intent_recovery_net.net[-1]
+            print(
+                f"[LatentRLActorCritic] P2-R intent recovery in={self.intent_recovery_net.in_dim} "
+                f"r_max={self.intent_recovery_r_max:.4f} ({math.degrees(math.atan(self.intent_recovery_r_max)):.1f}°) "
+                f"gate={self.intent_recovery_gate.extra_repr()} "
+                f"last||W||={float(last.weight.abs().max()):.1e} "
+                f"(g_phi frozen, r_eta=0 at init, no terrain scan)"
+            )
+
+        # ICR: small shared residual. Frozen Stage-2 / g_φ. No terrain, no gate.
+        if self.interaction_recovery:
+            from rsl_rl.modules.interaction_residual import InteractionResidual
+
+            if self.intent_recovery:
+                raise ValueError("interaction_recovery and intent_recovery cannot both be True")
+            if self.residual_corrector is not None:
+                for p in self.residual_corrector.parameters():
+                    p.requires_grad_(False)
+                self.residual_corrector.eval()
+            self.latent_log_std.requires_grad_(False)
+            self.interaction_net = InteractionResidual(
+                encoder=str(interaction_encoder),
+                history_len=int(interaction_history_len),
+                tangent=bool(interaction_tangent),
+                beta=float(interaction_beta),
+                r_max=float(interaction_r_max),
+            )
+            print(
+                f"[LatentRLActorCritic] ICR {self.interaction_net.extra_repr()} "
+                f"(g_phi frozen, Δz=0 at init, no terrain obs, no gate)"
+            )
+
+        # 0 disables. Used to stop unbounded log_std blow-ups in long latent-RL runs.
+        self.latent_std_min = float(kwargs.get("latent_std_min", 0.0) or 0.0)
+        self.latent_std_max = float(kwargs.get("latent_std_max", 0.0) or 0.0)
 
         # ---- Fresh critic MLP (M1: on whatever critic obs the runner passes) ----
         act_cls = resolve_nn_activation(critic_activation)
@@ -242,6 +416,7 @@ class LatentRLActorCritic(nn.Module):
             prev = int(h)
         critic_layers.append(nn.Linear(prev, 1))
         self.critic = nn.Sequential(*critic_layers)
+        self._last_terrain = None
 
         self.distribution: Normal | None = None
         # LatentBottleneckMUSEKp.__init__ (constructed above) reassigns
@@ -256,6 +431,11 @@ class LatentRLActorCritic(nn.Module):
             f"num_actions={num_actions} init_latent_std={init_latent_std} "
             f"prior_anchor_coef={self.prior_anchor_coef} "
             f"inner_freeze_mode={self.muse.freeze_mode!r}"
+            + (
+                f" terrain_scan_dim={self.terrain_scan_dim} r_max={self.terrain_r_max:.3f}"
+                if self.terrain_scan_dim > 0
+                else ""
+            )
             + (
                 f" lora(r={self._lora_rank}, alpha={self._lora_alpha}, "
                 f"targets={list(self._lora_targets)})"
@@ -291,52 +471,498 @@ class LatentRLActorCritic(nn.Module):
             f"targets={list(self._lora_targets)}); encoder base frozen."
         )
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Frozen nominal stack must stay eval even when PPO sets policy.train().
+        if self.residual_corrector is not None and (
+            self.terrain_scan_dim > 0 or self.intent_recovery or self.interaction_recovery
+        ):
+            self.residual_corrector.eval()
+        if self.adapter == "residual":
+            self.muse.transformer_encoder.eval()
+        return self
+
     # ----- Latent helpers -----------------------------------------------------------------------
 
     def _split_policy_obs(self, obs: torch.Tensor):
-        """Split the policy obs into (enc_obs, obstacle_feat [B,K,F], obstacle_mask [B,K]).
+        """Split into (enc_obs, scan, obstacle_feat, obstacle_mask).
 
-        Option C: the obstacle block is the LAST ``obstacle_feat_dim`` dims, so the frozen
-        encoder only ever sees ``enc_obs``. obstacle_* are None when obstacle obs is disabled.
-        Per box = [center_b(3), half(3), valid(1)]; the trailing valid flag becomes the
-        token key_padding mask (True = invalid/empty box -> excluded by g_φ)."""
+        Layout: ``[encoder_core | optional obstacle | height_scan LAST]``.
+        ``scan`` is zeros when the env does not append the 187-D block (scan-zero /
+        old 750-D eval). Obstacle extras follow the existing option-C contract.
+        """
+        rest = obs
+        scan = None
+        rec_aux = None
+        scan_dim = int(self.terrain_scan_dim)
+        aux_dim = int(self.intent_recovery_aux_dim)
+        if scan_dim > 0:
+            core_plus_obs = self._enc_obs_dim + self.obstacle_feat_dim
+            if int(obs.shape[-1]) == core_plus_obs:
+                scan = obs.new_zeros(*obs.shape[:-1], scan_dim)
+            elif int(obs.shape[-1]) >= scan_dim:
+                scan = obs[..., -scan_dim:]
+                rest = obs[..., :-scan_dim]
+            else:
+                scan = obs.new_zeros(*obs.shape[:-1], scan_dim)
+            if self.terrain_scan_zero:
+                scan = torch.zeros_like(scan)
+        if aux_dim > 0:
+            if int(rest.shape[-1]) >= aux_dim:
+                rec_aux = rest[..., -aux_dim:]
+                rest = rest[..., :-aux_dim]
+            else:
+                rec_aux = rest.new_zeros(*rest.shape[:-1], aux_dim)
         if self.obstacle_feat_dim <= 0:
-            return obs, None, None
-        enc = obs[..., : self._enc_obs_dim]
-        raw = obs[..., self._enc_obs_dim:].reshape(*obs.shape[:-1], self.obstacle_n, self._obstacle_per_box)
+            return rest, scan, None, None, rec_aux
+        enc = rest[..., : self._enc_obs_dim]
+        raw = rest[..., self._enc_obs_dim :].reshape(
+            *rest.shape[:-1], self.obstacle_n, self._obstacle_per_box
+        )
         feat = raw[..., : self._obstacle_per_box - 1]
         mask = raw[..., self._obstacle_per_box - 1] < 0.5
-        return enc, feat, mask
+        return enc, scan, feat, mask, rec_aux
 
-    def _encode_mean_latent(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (unit-norm mean latent ``mu_hat`` [B, latent_dim], proprio_per_frame)."""
-        # Safety net for the lora + no-warmstart path (idempotent; load_state_dict
-        # handles the warmstart/resume paths). NOTE for the parallel M4 (residual)
-        # work: keep this guard line if this method is rewritten.
-        if self.adapter == "lora":
-            self._ensure_lora_applied()
-        # Option C: strip the obstacle block so the frozen encoder sees its exact dim.
-        enc_obs, obstacle_feat, obstacle_mask = self._split_policy_obs(obs)
+    def _nominal_mean_latent(self, enc_obs, obstacle_feat, obstacle_mask):
+        """Frozen Stage-2 + frozen g_φ → unit-norm ``z_nom``."""
         mu, _log_sigma, proprio_per_frame = self.muse.transformer_encoder.encode(enc_obs)
-        mu_hat = self.muse._maybe_normalize_latent(mu)  # unit-norm; decoder geometry
+        mu_hat = self.muse._maybe_normalize_latent(mu)
         if getattr(self, "residual_corrector", None) is not None:
-            # Residual adapter (M4 / D2): shallow per-body-token transformer g_φ
-            # corrects the frozen encoder's latent. It consumes the SAME split
-            # tensors the encoder sees (split_obs is parse-only, no weights;
-            # masked KP excluded structurally via key_padding_mask inside g_φ)
-            # plus μ̂ AND the obstacle tokens (option C). μ̂ is constant w.r.t.
-            # trainable params (encoder frozen) -> detach; grad flows only through
-            # g_φ. One re-normalize keeps the unit-norm decoder geometry.
             kp, kp_mask, _prop = self.muse.transformer_encoder.split_obs(enc_obs)
             base = mu_hat.detach()
-            delta = self.residual_corrector(kp, kp_mask, proprio_per_frame, base, obstacle_feat, obstacle_mask)
+            delta = self.residual_corrector(
+                kp, kp_mask, proprio_per_frame, base, obstacle_feat, obstacle_mask
+            )
             mu_hat = self.muse._maybe_normalize_latent(
                 base + self.residual_corrector.alpha * delta
             )
         return mu_hat, proprio_per_frame
 
+    def _apply_terrain_residual(self, z_nom: torch.Tensor, scan: torch.Tensor | None):
+        """``h_η(H)`` + tangent cap + analytic α(H). Grad through ``h_η`` only."""
+        from rsl_rl.modules.terrain_residual import apply_tangent_correction
+
+        if self.terrain_residual is None or int(self.terrain_scan_dim) <= 0:
+            z = self.muse._maybe_normalize_latent(z_nom)
+            zeros = torch.zeros_like(z)
+            return z, zeros, zeros, zeros[..., 0]
+        if scan is None:
+            scan = z_nom.new_zeros(z_nom.shape[0], self.terrain_scan_dim)
+        z_det = z_nom.detach()
+        u = self.terrain_residual(scan)
+        if self.terrain_gate is not None:
+            alpha, _s, _ss, _sr = self.terrain_gate(scan)
+        else:
+            alpha = scan.new_ones(scan.shape[0])
+        z_exec, u_bar = apply_tangent_correction(z_det, u, r_max=self.terrain_r_max, alpha=alpha)
+        return z_exec, u_bar, u, alpha
+
+    def _slot0_idx(self) -> int:
+        offsets = tuple(int(x) for x in self.muse.kp_slot_offsets)
+        return int(offsets.index(0))
+
+    def _denorm_enc_obs(self, enc_obs: torch.Tensor) -> torch.Tensor:
+        """Invert empirical normalization so gate ``E`` is metres, not z-scores.
+
+        The frozen encoder still sees the normalized ``enc_obs``. Only ``r_η``'s
+        ``e, ė`` and the risk gate read this inverse. A missing or dim-mismatched
+        normalizer is a hard error in recovery mode: silent fallback would
+        re-open the always-on gate (``E≈1.2`` vs Q90 ``0.13 m``).
+        """
+        if not (self.intent_recovery or self.interaction_recovery):
+            return enc_obs
+        nrm = self._recovery_obs_nrm[0] if self._recovery_obs_nrm else None
+        if nrm is None or not hasattr(nrm, "inverse"):
+            return enc_obs
+        mean = getattr(nrm, "_mean", None)
+        if mean is not None and int(mean.reshape(-1).shape[0]) != int(enc_obs.shape[-1]):
+            raise RuntimeError(
+                f"obs_normalizer dim {int(mean.reshape(-1).shape[0])} != enc_obs {int(enc_obs.shape[-1])}"
+            )
+        return nrm.inverse(enc_obs)
+
+    def _stability_from_aux(self, rec_aux: torch.Tensor | None, batch: int, like: torch.Tensor) -> torch.Tensor:
+        """``S = |v_root,z|`` from optional trailing aux; else 0 (R1a loco: R = R_E)."""
+        if rec_aux is None or int(self.intent_recovery_aux_dim) <= 0:
+            return like.new_zeros(batch)
+        return rec_aux[..., 0].reshape(batch).abs()
+
+    def _apply_intent_recovery(
+        self,
+        z_nom: torch.Tensor,
+        enc_obs: torch.Tensor,
+        proprio_per_frame: torch.Tensor,
+        rec_aux: torch.Tensor | None,
+        mutate_gate: bool = True,
+    ) -> tuple[torch.Tensor, dict]:
+        """Gated tangent residual. ``sg(z_nom)`` into ``r_η``; encoder/g_φ stay frozen."""
+        from rsl_rl.modules.intent_recovery import (
+            DT,
+            apply_recovery_correction,
+            extract_visible_task_error,
+        )
+
+        if self.intent_recovery_net is None or self.intent_recovery_gate is None:
+            z = self.muse._maybe_normalize_latent(z_nom)
+            empty = {
+                "z_exec": z,
+                "r_raw": torch.zeros_like(z),
+                "r_perp": torch.zeros_like(z),
+                "r_bar": torch.zeros_like(z),
+                "r_raw_norm": z.new_zeros(z.shape[0]),
+                "r_perp_norm": z.new_zeros(z.shape[0]),
+                "r_bar_norm": z.new_zeros(z.shape[0]),
+                "rho_r": z.new_zeros(z.shape[0]),
+                "theta": z.new_zeros(z.shape[0]),
+                "alpha": z.new_zeros(z.shape[0]),
+                "E": z.new_zeros(z.shape[0]),
+                "S": z.new_zeros(z.shape[0]),
+                "R": z.new_zeros(z.shape[0]),
+                "R_E": z.new_zeros(z.shape[0]),
+                "R_S": z.new_zeros(z.shape[0]),
+                "active": z.new_zeros(z.shape[0]),
+                "e": z.new_zeros(z.shape[0], 9),
+                "vis": z.new_zeros(z.shape[0], 3),
+            }
+            return z, empty
+
+        enc_m = self._denorm_enc_obs(enc_obs)
+        kp, kp_mask, _prop = self.muse.transformer_encoder.split_obs(enc_m)
+        # kp is [B, N, L*3]; restore [B, L, N, 3] via the layout used in split_obs.
+        enc = self.muse.transformer_encoder
+        bsz = int(z_nom.shape[0])
+        L, n_b = int(enc.kp_lookahead_steps), int(enc.kp_n_bodies)
+        kp_lhn = kp.reshape(bsz, n_b, L, 3).transpose(1, 2)
+        e, vis, e_rms = extract_visible_task_error(kp_lhn, kp_mask, self._slot0_idx())
+        if self._prev_e is None or int(self._prev_e.shape[0]) != bsz:
+            e_dot = torch.zeros_like(e)
+        else:
+            e_dot = (e - self._prev_e) / DT
+        e_dot = e_dot * vis.repeat_interleave(3, dim=-1)
+        if mutate_gate:
+            self._prev_e = e.detach()
+
+        s = self._stability_from_aux(rec_aux, bsz, e_rms)
+        if self._recovery_force_alpha is not None:
+            alpha = e_rms.new_full((bsz,), float(self._recovery_force_alpha))
+            gate_out = self.intent_recovery_gate.scores(e_rms, s)
+            r, r_e, r_s = gate_out
+            active = alpha > 0
+        elif self._recovery_alpha_override is not None:
+            alpha = self._recovery_alpha_override.reshape(-1).to(dtype=e_rms.dtype, device=e_rms.device)
+            r, r_e, r_s = self.intent_recovery_gate.scores(e_rms, s)
+            active = alpha > 0
+        else:
+            gate_n = (
+                0
+                if self.intent_recovery_gate._active is None
+                else int(self.intent_recovery_gate._active.shape[0])
+            )
+            use_state = mutate_gate and gate_n in (0, bsz)
+            gout = self.intent_recovery_gate.step(e_rms, s, mutate=use_state)
+            alpha, r, r_e, r_s = gout["alpha"], gout["R"], gout["R_E"], gout["R_S"]
+            active = gout["active"]
+
+        r_raw = self.intent_recovery_net(
+            e, e_dot, vis, proprio_per_frame.reshape(bsz, -1), z_nom.detach()
+        )
+        out = apply_recovery_correction(z_nom, r_raw, alpha, r_max=self.intent_recovery_r_max)
+        out.update(
+            {
+                "E": e_rms,
+                "S": s,
+                "R": r,
+                "R_E": r_e,
+                "R_S": r_s,
+                "active": active.to(dtype=e_rms.dtype),
+                "e": e,
+                "vis": vis,
+                "e_dot": e_dot,
+            }
+        )
+        return out["z_exec"], out
+
+    def _apply_interaction_residual(
+        self,
+        z_nom: torch.Tensor,
+        enc_obs: torch.Tensor,
+        proprio_per_frame: torch.Tensor,
+        mutate_hist: bool = True,
+    ) -> tuple[torch.Tensor, dict]:
+        """Shared latent residual. No terrain features. Last Linear is zero at init."""
+        from rsl_rl.modules.intent_recovery import DT, extract_visible_task_error
+        from rsl_rl.modules.interaction_residual import pack_token
+
+        z = self.muse._maybe_normalize_latent(z_nom)
+        if self.interaction_net is None:
+            empty = {
+                "z_exec": z,
+                "dz": torch.zeros_like(z),
+                "dz_bar": torch.zeros_like(z),
+                "r_raw": torch.zeros_like(z),
+                "r_bar": torch.zeros_like(z),
+                "r_raw_norm": z.new_zeros(z.shape[0]),
+                "r_bar_norm": z.new_zeros(z.shape[0]),
+                "alpha": z.new_ones(z.shape[0]),
+                "E": z.new_zeros(z.shape[0]),
+                "R_E": z.new_zeros(z.shape[0]),
+                "R": z.new_zeros(z.shape[0]),
+                "active": z.new_ones(z.shape[0]),
+                "e": z.new_zeros(z.shape[0], 9),
+            }
+            return z, empty
+        enc_m = self._denorm_enc_obs(enc_obs)
+        kp, kp_mask, _prop = self.muse.transformer_encoder.split_obs(enc_m)
+        enc = self.muse.transformer_encoder
+        bsz = int(z_nom.shape[0])
+        L, n_b = int(enc.kp_lookahead_steps), int(enc.kp_n_bodies)
+        kp_lhn = kp.reshape(bsz, n_b, L, 3).transpose(1, 2)
+        e, vis, e_rms = extract_visible_task_error(kp_lhn, kp_mask, self._slot0_idx())
+        if self._prev_e is None or int(self._prev_e.shape[0]) != bsz:
+            e_dot = torch.zeros_like(e)
+        else:
+            e_dot = (e - self._prev_e) / DT
+        e_dot = e_dot * vis.repeat_interleave(3, dim=-1)
+        if mutate_hist:
+            self._prev_e = e.detach()
+        tok = pack_token(z.detach(), e, e_dot, proprio_per_frame)
+        if not mutate_hist and self.interaction_net.encoder_name == "gru":
+            dz = self.interaction_net.body(self.interaction_net._hist)
+            z_n = torch.nn.functional.normalize(z, dim=-1, eps=1e-8)
+            if self.interaction_net.tangent:
+                from rsl_rl.modules.terrain_residual import apply_tangent_correction
+
+                z_exec, dz_bar = apply_tangent_correction(
+                    z_n, dz, r_max=self.interaction_net.r_max,
+                    alpha=z_n.new_full((z_n.shape[0],), self.interaction_net.beta),
+                )
+            else:
+                z_exec = torch.nn.functional.normalize(
+                    z_n + self.interaction_net.beta * dz, dim=-1, eps=1e-8
+                )
+                dz_bar = dz
+            out = {
+                "z_exec": z_exec,
+                "dz": dz,
+                "dz_bar": dz_bar,
+                "dz_norm": dz.norm(dim=-1),
+                "dz_bar_norm": dz_bar.norm(dim=-1),
+            }
+        else:
+            out = self.interaction_net.apply(z, tok)
+        rec = {
+            "z_exec": out["z_exec"],
+            "r_raw": out["dz"],
+            "r_bar": out["dz_bar"],
+            "r_raw_norm": out["dz_norm"],
+            "r_bar_norm": out["dz_bar_norm"],
+            "alpha": z.new_full((bsz,), float(self.interaction_net.beta)),
+            "E": e_rms,
+            "R_E": e_rms,
+            "R": e_rms,
+            "R_S": z.new_zeros(bsz),
+            "S": z.new_zeros(bsz),
+            "active": z.new_ones(bsz),
+            "e": e,
+            "vis": vis,
+            "theta": z.new_zeros(bsz),
+            "rho_r": z.new_zeros(bsz),
+            "r_perp_norm": out["dz_bar_norm"],
+        }
+        return out["z_exec"], rec
+
+    def _encode_mean_latent(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (unit-norm mean latent ``mu_hat`` [B, latent_dim], proprio_per_frame)."""
+        if self.adapter == "lora":
+            self._ensure_lora_applied()
+        enc_obs, scan, obstacle_feat, obstacle_mask, rec_aux = self._split_policy_obs(obs)
+        z_nom, proprio_per_frame = self._nominal_mean_latent(
+            enc_obs, obstacle_feat, obstacle_mask
+        )
+        z_mid, u_bar, u, t_alpha = self._apply_terrain_residual(z_nom, scan)
+        gate_n = (
+            0
+            if self.intent_recovery_gate is None or self.intent_recovery_gate._active is None
+            else int(self.intent_recovery_gate._active.shape[0])
+        )
+        bsz = int(z_nom.shape[0])
+        mutate = (
+            self._recovery_force_alpha is None
+            and self._recovery_alpha_override is None
+            and gate_n in (0, bsz)
+        )
+        z_exec, rec = self._apply_intent_recovery(
+            z_mid, enc_obs, proprio_per_frame, rec_aux, mutate_gate=mutate
+        )
+        if self.interaction_net is not None:
+            z_exec, rec = self._apply_interaction_residual(
+                z_exec if self.intent_recovery else z_mid,
+                enc_obs,
+                proprio_per_frame,
+                mutate_hist=mutate,
+            )
+        rec_alpha = rec.get("alpha")
+        rec_bar = rec.get("r_bar", u)
+        self._last_terrain = {
+            "u_perp": (rec_bar if torch.is_tensor(rec_bar) else u_bar).detach(),
+            "z_nom": z_nom.detach(),
+            "z_exec": z_exec.detach(),
+            "u": rec.get("r_raw", u).detach() if torch.is_tensor(rec.get("r_raw", u)) else u.detach(),
+            "alpha": rec_alpha.detach() if torch.is_tensor(rec_alpha) else t_alpha,
+            "scan": None if scan is None else scan.detach(),
+        }
+        self._last_recovery = {k: (v.detach() if torch.is_tensor(v) else v) for k, v in rec.items()}
+        self._last_recovery["z_nom"] = z_nom.detach()
+        return z_exec, proprio_per_frame
+
+    def terrain_aux_terms(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """``L_zero = ‖h_η(0)‖²``, ``L_calm = (1-α)‖ū‖²``. Grad through ``h_η``."""
+        if self.terrain_residual is None or int(self.terrain_scan_dim) <= 0:
+            return None
+        _enc, scan, _feat, _mask, _aux = self._split_policy_obs(obs)
+        if scan is None:
+            return None
+        u0 = self.terrain_residual(torch.zeros_like(scan))
+        l_zero = u0.pow(2).sum(dim=-1).mean()
+        z_nom, _ = self._nominal_mean_latent(_enc, _feat, _mask)
+        _z_exec, u_bar, _u, alpha = self._apply_terrain_residual(z_nom, scan)
+        a = alpha.reshape(-1).to(dtype=u_bar.dtype)
+        l_calm = ((1.0 - a) * u_bar.pow(2).sum(dim=-1)).mean()
+        return l_zero, l_calm
+
+    def residual_deltas(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Student vs frozen parent ``g_φ`` outputs ``(Δz, Δz0)``. Encoder is frozen."""
+        parent = getattr(self, "parent_residual_corrector", None)
+        if self.residual_corrector is None or parent is None:
+            raise RuntimeError("residual_deltas requires residual adapter + parent_residual_corrector")
+        enc_obs, _scan, obstacle_feat, obstacle_mask, _aux = self._split_policy_obs(obs)
+        mu, _log_sigma, proprio_per_frame = self.muse.transformer_encoder.encode(enc_obs)
+        base = self.muse._maybe_normalize_latent(mu).detach()
+        kp, kp_mask, _prop = self.muse.transformer_encoder.split_obs(enc_obs)
+        delta = self.residual_corrector(kp, kp_mask, proprio_per_frame, base, obstacle_feat, obstacle_mask)
+        with torch.no_grad():
+            delta0 = parent(kp, kp_mask, proprio_per_frame, base, obstacle_feat, obstacle_mask)
+        return delta, delta0
+
+    def exec_and_parent_latents(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Unit-sphere ``(z_exec, z_parent)``. Grad flows only through student ``g_φ``."""
+        parent = getattr(self, "parent_residual_corrector", None)
+        if self.residual_corrector is None or parent is None:
+            raise RuntimeError("exec_and_parent_latents needs residual adapter + frozen parent")
+        enc_obs, scan, obstacle_feat, obstacle_mask, rec_aux = self._split_policy_obs(obs)
+        mu, _log_sigma, proprio_per_frame = self.muse.transformer_encoder.encode(enc_obs)
+        z_base = self.muse._maybe_normalize_latent(mu).detach()
+        kp, kp_mask, _prop = self.muse.transformer_encoder.split_obs(enc_obs)
+        alpha = float(self.residual_corrector.alpha)
+        delta = self.residual_corrector(kp, kp_mask, proprio_per_frame, z_base, obstacle_feat, obstacle_mask)
+        z_nom = self.muse._maybe_normalize_latent(z_base + alpha * delta)
+        z_mid, _u_bar, _u, _alpha = self._apply_terrain_residual(z_nom, scan)
+        z_exec, _rec = self._apply_intent_recovery(
+            z_mid, enc_obs, proprio_per_frame, rec_aux, mutate_gate=False
+        )
+        with torch.no_grad():
+            delta0 = parent(kp, kp_mask, proprio_per_frame, z_base, obstacle_feat, obstacle_mask)
+            z_parent = self.muse._maybe_normalize_latent(z_base + alpha * delta0)
+        return z_exec, z_parent
+
+    @torch.no_grad()
+    def last_terrain_stats(self) -> dict[str, torch.Tensor] | None:
+        """Cheap per-env stats from the most recent ``act`` encode (no encoder replay)."""
+        cache = getattr(self, "_last_terrain", None)
+        if cache is None:
+            return None
+        z_nom = cache["z_nom"]
+        z_exec = cache["z_exec"]
+        u_perp = cache["u_perp"]
+        u = cache["u"]
+        alpha = cache.get("alpha")
+        if alpha is None:
+            alpha = z_nom.new_ones(z_nom.shape[0])
+        elif not torch.is_tensor(alpha):
+            alpha = z_nom.new_full((z_nom.shape[0],), float(alpha))
+        alpha = alpha.reshape(-1).to(dtype=z_nom.dtype)
+        cos = (z_nom * z_exec).sum(dim=-1).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+        ang = torch.acos(cos) * (180.0 / math.pi)
+        r_max = float(self.intent_recovery_r_max if self.intent_recovery else self.terrain_r_max)
+        theta_avail = torch.atan(alpha * r_max) * (180.0 / math.pi)
+        # α≈0 (dead zone / true-flat) makes θ_avail~0 and acos noise (~0.08°)
+        # would explode ρ. Only score saturation when the gate actually granted budget.
+        rho = torch.where(
+            theta_avail > 0.3,
+            ang / theta_avail.clamp_min(1e-3),
+            torch.zeros_like(ang),
+        )
+        dz = (alpha * u_perp.norm(dim=-1))
+        sens = torch.zeros(z_nom.shape[0], device=z_nom.device, dtype=z_nom.dtype)
+        scan = cache.get("scan")
+        if self.terrain_residual is not None and scan is not None:
+            u0 = self.terrain_residual(torch.zeros_like(scan))
+            sens = (u - u0).norm(dim=-1)
+        return {
+            "u_perp": u_perp.norm(dim=-1),
+            "ang_deg": ang,
+            "scan_sens": sens,
+            "alpha": alpha,
+            "rho_auth": rho,
+            "dz": dz,
+            "sat": (rho > 0.95).to(dtype=z_nom.dtype),
+        }
+
+    @torch.no_grad()
+    def last_recovery_stats(self) -> dict[str, torch.Tensor] | None:
+        """Per-env recovery logs from the most recent encode (no future labels)."""
+        cache = getattr(self, "_last_recovery", None)
+        if cache is None or not (self.intent_recovery or self.interaction_recovery):
+            return None
+        z_nom = cache.get("z_nom")
+        z_exec = cache["z_exec"]
+        if z_nom is None:
+            z_nom = z_exec
+        keys = (
+            "E", "S", "R", "R_E", "R_S", "alpha", "active",
+            "r_raw_norm", "r_perp_norm", "r_bar_norm", "rho_r", "theta",
+        )
+        out = {}
+        for k in keys:
+            v = cache.get(k)
+            if v is None:
+                continue
+            out[k] = v.reshape(-1).to(dtype=z_exec.dtype) if torch.is_tensor(v) else z_exec.new_full((z_exec.shape[0],), float(v))
+        out["theta_deg"] = out["theta"] * (180.0 / math.pi) if "theta" in out else z_exec.new_zeros(z_exec.shape[0])
+        return out
+
+    @torch.no_grad()
+    def recovery_R_E_from_obs(self, obs: torch.Tensor, *, obs_is_normalized: bool) -> torch.Tensor:
+        """Stateless ``R_E`` from actor obs. Does **not** step the hysteresis gate."""
+        from rsl_rl.modules.intent_recovery import extract_visible_task_error
+
+        if self.intent_recovery_gate is None and self.interaction_net is None:
+            return obs.new_zeros(obs.shape[0])
+        enc, _scan, _feat, _mask, rec_aux = self._split_policy_obs(obs)
+        enc_m = self._denorm_enc_obs(enc) if obs_is_normalized else enc
+        kp, kp_mask, _prop = self.muse.transformer_encoder.split_obs(enc_m)
+        bsz = int(enc_m.shape[0])
+        enc = self.muse.transformer_encoder
+        L, n_b = int(enc.kp_lookahead_steps), int(enc.kp_n_bodies)
+        kp_lhn = kp.reshape(bsz, n_b, L, 3).transpose(1, 2)
+        _e, _vis, e_rms = extract_visible_task_error(kp_lhn, kp_mask, self._slot0_idx())
+        if self.intent_recovery_gate is None:
+            return e_rms.reshape(-1)
+        s = self._stability_from_aux(rec_aux, bsz, e_rms)
+        _r, r_e, _r_s = self.intent_recovery_gate.scores(e_rms, s)
+        return r_e.reshape(-1)
+
     def update_distribution(self, observations: torch.Tensor) -> None:
         mean, _proprio = self._encode_mean_latent(observations)
+        if self.latent_std_min > 0.0 or self.latent_std_max > 0.0:
+            lo = math.log(self.latent_std_min) if self.latent_std_min > 0.0 else None
+            hi = math.log(self.latent_std_max) if self.latent_std_max > 0.0 else None
+            if lo is not None and hi is not None:
+                self.latent_log_std.data.clamp_(lo, hi)
+            elif lo is not None:
+                self.latent_log_std.data.clamp_(min=lo)
+            else:
+                self.latent_log_std.data.clamp_(max=hi)
         std = torch.exp(self.latent_log_std).expand_as(mean).clamp_min(1.0e-6)
         self.distribution = Normal(mean, std)
 
@@ -360,6 +986,50 @@ class LatentRLActorCritic(nn.Module):
         z = self.muse._maybe_normalize_latent(mean)
         return self.muse._decode(z, proprio)
 
+    @torch.no_grad()
+    def inspect_inference(self, observations: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Deploy diagnostics: ``z_base``, residual ``Δz``, ``z_exec``, 29-D joints."""
+        enc_obs, scan, obstacle_feat, obstacle_mask, rec_aux = self._split_policy_obs(observations)
+        z_nom, proprio_per_frame = self._nominal_mean_latent(
+            enc_obs, obstacle_feat, obstacle_mask
+        )
+        z_base = z_nom
+        delta = torch.zeros_like(z_nom)
+        z_mid, u_perp_t, u_t, gate_t = self._apply_terrain_residual(z_nom, scan)
+        z_exec, rec = self._apply_intent_recovery(
+            z_mid, enc_obs, proprio_per_frame, rec_aux, mutate_gate=False
+        )
+        if self.interaction_net is not None:
+            z_exec, rec = self._apply_interaction_residual(
+                z_mid, enc_obs, proprio_per_frame, mutate_hist=False
+            )
+        u_perp = rec.get("r_bar", u_perp_t)
+        u = rec.get("r_raw", u_t)
+        gate_a = rec.get("alpha", gate_t)
+        action = self.muse._decode(z_exec, proprio_per_frame)
+        cos = (z_nom * z_exec).sum(dim=-1) / (
+            z_nom.norm(dim=-1).clamp_min(1e-8) * z_exec.norm(dim=-1).clamp_min(1e-8)
+        )
+        angle = torch.acos(cos.clamp(-1.0 + 1e-6, 1.0 - 1e-6))
+        out = {
+            "action": action,
+            "z_base": z_base,
+            "z_nom": z_nom,
+            "delta_z": rec.get("r_raw", delta),
+            "delta_z_eff": u_perp,
+            "u": u,
+            "u_perp": u_perp,
+            "z_exec": z_exec,
+            "cos_base_exec": cos,
+            "angle_base_exec": angle,
+            "residual_alpha": gate_a if torch.is_tensor(gate_a) else torch.full(cos.shape, float(gate_a), device=cos.device, dtype=cos.dtype),
+            "terrain_alpha": gate_t if torch.is_tensor(gate_t) else torch.full(cos.shape, float(gate_t), device=cos.device, dtype=cos.dtype),
+        }
+        for k in ("E", "S", "R", "R_E", "R_S", "rho_r", "vis", "e"):
+            if k in rec:
+                out[k] = rec[k]
+        return out
+
     def decode_for_env(self, latent: torch.Tensor, observations: torch.Tensor) -> torch.Tensor:
         """Frozen decoder: renormalize the sampled latent and decode to a joint action.
 
@@ -368,7 +1038,7 @@ class LatentRLActorCritic(nn.Module):
         detached the stored action).
         """
         with torch.no_grad():
-            enc_obs, _f, _m = self._split_policy_obs(observations)  # option C: drop obstacle block
+            enc_obs, _scan, _f, _m, _aux = self._split_policy_obs(observations)
             _kp, _kp_mask, proprio_per_frame = self.muse.transformer_encoder.split_obs(enc_obs)
             z = self.muse._maybe_normalize_latent(latent)
             return self.muse._decode(z, proprio_per_frame)
@@ -403,8 +1073,9 @@ class LatentRLActorCritic(nn.Module):
                     p.requires_grad_(False)
                 ref.eval()
                 object.__setattr__(self, "_ref_encoder", ref)
-            mu_cur, _, _ = self.muse.transformer_encoder.encode(observations)
-            mu_ref, _, _ = self._ref_encoder.encode(observations)
+            enc_obs, _scan, _f, _m, _aux = self._split_policy_obs(observations)
+            mu_cur, _, _ = self.muse.transformer_encoder.encode(enc_obs)
+            mu_ref, _, _ = self._ref_encoder.encode(enc_obs)
             mu_cur = self.muse._maybe_normalize_latent(mu_cur)
             mu_ref = self.muse._maybe_normalize_latent(mu_ref)
             return nn.functional.cosine_similarity(mu_cur, mu_ref, dim=-1)  # [N]
@@ -413,7 +1084,18 @@ class LatentRLActorCritic(nn.Module):
         return self.critic(critic_observations)
 
     def reset(self, dones=None) -> None:
-        return
+        if self.intent_recovery_gate is not None:
+            self.intent_recovery_gate.reset(dones)
+        if self.interaction_net is not None:
+            self.interaction_net.reset(dones)
+        if dones is None:
+            self._prev_e = None
+            return
+        if self._prev_e is None:
+            return
+        d = dones.reshape(-1).to(device=self._prev_e.device, dtype=torch.bool)
+        if int(d.shape[0]) == int(self._prev_e.shape[0]):
+            self._prev_e[d] = 0
 
     def forward(self):
         raise NotImplementedError
@@ -473,5 +1155,23 @@ class LatentRLActorCritic(nn.Module):
         # (muse...parametrizations.*), so LoRA must be injected BEFORE loading
         # so the keys exist on this module.
         self._ensure_lora_applied()
+        state_dict = {
+            k: v
+            for k, v in state_dict.items()
+            if not k.startswith("intent_recovery_obs_normalizer.")
+        }
+        own_keys = set(self.state_dict().keys())
+        ckpt_keys = set(state_dict.keys())
+        missing = own_keys - ckpt_keys
+        def _ok_new(k: str) -> bool:
+            return k.startswith("terrain_residual.") or k.startswith("intent_recovery") or k.startswith("interaction_net.")
+        if missing and all(_ok_new(k) for k in missing):
+            super().load_state_dict(state_dict, strict=False)
+            prefixes = sorted({k.split(".")[0] for k in missing})
+            print(
+                f"[LatentRLActorCritic] loaded nominal ckpt; "
+                f"zero-init {len(missing)} new tensors ({prefixes})"
+            )
+            return True
         super().load_state_dict(state_dict, strict=strict)
         return True

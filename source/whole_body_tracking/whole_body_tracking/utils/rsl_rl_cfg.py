@@ -861,6 +861,10 @@ class RslRlLatentRLActorCriticCfg(RslRlMUSEKpDistillationCfg):
     init_latent_std: float = 0.1
     """State-independent Gaussian std over the unit-norm latent (decision D1).
     Small so step-0 ≈ the distilled deterministic policy (safe start)."""
+    latent_std_min: float = 0.0
+    """If >0, clamp ``exp(latent_log_std)`` from below each act (stops std collapse)."""
+    latent_std_max: float = 0.0
+    """If >0, clamp ``exp(latent_log_std)`` from above each act (stops the ~39k entropy blow-up)."""
 
     # --- obstacle obs (option C); 0 = disabled (writing / general latent-RL unchanged) ---
     obstacle_feat_dim: int = 0
@@ -898,6 +902,61 @@ class RslRlLatentRLActorCriticCfg(RslRlMUSEKpDistillationCfg):
     residual_alpha: float = 1.0
     """Scalar on Δz in ``normalize(μ̂ + α·Δz)``."""
 
+    # --- P2-D gated terrain residual (only when terrain_scan_dim > 0) ---
+    terrain_scan_dim: int = 0
+    """Height-scan dims appended LAST to the policy obs (Isaac 17×11=187). 0 disables."""
+    terrain_r_max: float = 0.1763
+    """Geometric cap on ‖ū‖. tan(10°) ≈ 0.176 → max 10° latent rotation before the gate."""
+    terrain_scan_zero: bool = False
+    """Ablation: force H_t=0 while keeping h_η. Must stay False for the main run."""
+    terrain_gate: bool = True
+    """Analytic severity gate α(H) with α(0)=0. P2-D default on."""
+    terrain_gate_w_s: float = 1.0
+    """Weight on local-plane gradient √(a²+b²)."""
+    terrain_gate_w_r: float = 2.5
+    """Weight on P95 plane residual (metres). Sized so Flat/Light stay low vs Slope/Steps."""
+    terrain_gate_s0: float = 0.06
+    terrain_gate_tau: float = 0.025
+    terrain_gate_s_dead: float = 0.02
+    """s < s_dead ⇒ α=0. Covers true-flat / H=0."""
+    terrain_scan_clip: float = 0.5
+    """Obs scan is already /clip_abs; gate multiplies back to metres."""
+
+    # --- P2-R intent recovery (no terrain observation; default off) ---
+    intent_recovery: bool = False
+    """Gated latent residual ``r_η``. Zero-init last layer. Parent is ``model_50000``."""
+    intent_recovery_r_max: float = 0.0875
+    """``tan(5°)``. Geometric cap on ‖r̄_⊥‖."""
+    intent_recovery_r_off: float = 0.6
+    """Hysteresis release threshold. Must be in (0, 1) so α>0 at first trigger."""
+    intent_recovery_r_full: float = 2.0
+    """R at which α=1. α = active · clip((R−R_off)/(R_full−R_off), 0, 1)."""
+    intent_recovery_persist_on: int = 3
+    """Frames of R≥1 before Detect. 3 × 20 ms = 60 ms."""
+    intent_recovery_persist_off: int = 3
+    """Frames of R<R_off before Release."""
+    intent_recovery_q50_e: float = 0.046
+    intent_recovery_q90_e: float = 0.130
+    """Loco Flat+Light healthy envelope (metres). R_E=1 at 13 cm."""
+    intent_recovery_q50_s: float = 0.041
+    intent_recovery_q90_s: float = 0.241
+    """Loco Flat+Light |v_root,z| envelope (m/s). Unused when aux_dim=0 (S=0)."""
+    intent_recovery_aux_dim: int = 0
+    """Trailing actor extras stripped before the encoder. 1 = |v_root,z|. 0 for R1a loco."""
+    intent_recovery_s_enabled: bool = False
+    """R1a: False so R = R_E. R1b turns this on for max(R_E, R_S)."""
+
+    # --- ICR interaction residual (no terrain; no gate until M2/M3 beat M0/M1) ---
+    interaction_recovery: bool = False
+    """Small shared latent residual from command-response history. Frozen Stage-2."""
+    interaction_encoder: str = "mlp"
+    """mlp = instantaneous (M1); gru = history (M2/M3)."""
+    interaction_history_len: int = 16
+    interaction_tangent: bool = True
+    interaction_beta: float = 1.0
+    interaction_r_max: float = 0.0875
+    """tan(5°)."""
+
 
 @configclass
 class RslRlLatentPPOAlgorithmCfg(RslRlPpoAlgorithmCfg):
@@ -919,6 +978,45 @@ class RslRlLatentPPOAlgorithmCfg(RslRlPpoAlgorithmCfg):
     ``coef·(1 − cos(μ, μ_distilled))`` from the per-step reward (reward-side
     operationalization in ``LatentPPO.process_env_step``). Run BOTH (D3) to keep
     the anchored-vs-unanchored comparison honest. Typical anchored value ~0.05."""
+
+    parent_residual_anchor_coef: float = 0.0
+    """P2-A hard L2 on ``g_φ−g_{φ0}``. Keep at 0 when using elastic latent TR."""
+
+    elastic_latent_coef: float = 0.0
+    """P2-B: weight on elastic latent spring (``λ_s``). ``0`` disables."""
+
+    elastic_damp_coef: float = 0.05
+    """P2-B dashpot on ``‖d_t − d_{t-1}‖²`` where ``d = z_exec − z_parent``."""
+
+    elastic_theta_easy_deg: float = 10.0
+    """Dead-zone on Flat/Light (degrees). Inside: no spring force."""
+
+    elastic_theta_hard_deg: float = 25.0
+    """Dead-zone on Slope/Steps (degrees)."""
+
+    elastic_k_easy: float = 1.0
+    """Spring stiffness on Flat/Light."""
+
+    elastic_k_hard: float = 0.25
+    """Spring stiffness on Slope/Steps (``~0.25 k_easy``)."""
+
+    terrain_zero_coef: float = 0.0
+    """P2-D: λ_0 on ‖h_η(0)‖². Kill scan-independent bias. 0 disables."""
+
+    terrain_calm_coef: float = 0.0
+    """P2-D: λ_c on (1-α)‖ū‖². Less evidence → less residual freedom. 0 disables."""
+
+    recovery_progress_coef: float = 0.0
+    """R1a-2a: λ_p on active-only clipped R_E progress. 0 disables (R1a)."""
+
+    recovery_progress_clip: float = 1.0
+    """clip(R_E,t − R_E,t+1, −c_p, c_p). Terminal transitions are zeroed first."""
+
+    recovery_release_coef: float = 0.0
+    """R1a-2a: must stay 0 (progress only). Sparse release bonus is R1a-2b."""
+
+    interaction_dz_coef: float = 0.0
+    """ICR: λ_z on ‖Δz‖². 0 disables. Typical 0.01–0.05."""
 
     encoder_decoder_warmstart_checkpoint_path: str | None = None
     """Distilled MUSE-Kp ``.pt`` to warmstart the policy (encoder + decoder +

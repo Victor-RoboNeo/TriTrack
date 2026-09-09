@@ -216,6 +216,17 @@ class OnPolicyRunner:
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent | LatentBottleneckAnyBody | LatentBottleneckAnyBodyActorCritic | LatentBottleneckMUSE | LatentBottleneckMUSETransformer | LatentBottleneckMUSEKp | LatentBottleneckPULSE | LatentBottleneckPULSEAdv | LatentBottleneck2B = policy_class(
             num_actor_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
+        self._terrain_scan_dim = int(getattr(policy, "terrain_scan_dim", 0) or 0)
+        self._obs_norm_dim = (
+            int(num_obs) - self._terrain_scan_dim
+            if self._terrain_scan_dim > 0 and int(num_obs) > self._terrain_scan_dim
+            else int(num_obs)
+        )
+        if self._terrain_scan_dim > 0:
+            print(
+                f"[Runner] P2-C height scan dim={self._terrain_scan_dim}; "
+                f"student normalizer on core {self._obs_norm_dim}-D (scan stays un-normalized)"
+            )
 
         if getattr(policy, "_teacher_goal_adapter", None) is not None:
             print(
@@ -319,7 +330,7 @@ class OnPolicyRunner:
             # Teacher obs normalizer (not used for residual learning)
             self.teacher_obs_normalizer = torch.nn.Identity().to(self.device)
         elif self.empirical_normalization:
-            self.obs_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8).to(self.device)
+            self.obs_normalizer = EmpiricalNormalization(shape=[self._obs_norm_dim], until=1.0e8).to(self.device)
             self.privileged_obs_normalizer = EmpiricalNormalization(shape=[num_privileged_obs], until=1.0e8).to(
                 self.device
             )
@@ -725,6 +736,11 @@ class OnPolicyRunner:
         )
 
     def _normalize_student_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        scan = None
+        scan_dim = int(getattr(self, "_terrain_scan_dim", 0) or 0)
+        if scan_dim > 0 and int(obs.shape[-1]) == int(self._obs_norm_dim) + scan_dim:
+            scan = obs[..., -scan_dim:]
+            obs = obs[..., :-scan_dim]
         if not self._use_anybody_latent_split_normalizers():
             out = self.obs_normalizer(obs)
         else:
@@ -735,6 +751,8 @@ class OnPolicyRunner:
             goal_obs = self.student_goal_obs_normalizer(goal_obs)
             proprio_obs = self.student_proprio_obs_normalizer(proprio_obs)
             out = torch.cat([goal_obs, proprio_obs], dim=-1)
+        if scan is not None:
+            out = torch.cat([out, scan], dim=-1)
         # Masked keypoints (NaN in env / after norm) must not reach the MLP; where() zeros grad on those dims.
         return replace_nonfinite_with_zeros(out)
 
@@ -1535,16 +1553,21 @@ class OnPolicyRunner:
         print(f"[Runner] reset_noise_std_on_resume = {reset_noise}")
         if reset_noise:
             init_noise_std = self.policy_cfg.get("init_noise_std", 1.0)
-            noise_std_type = self.policy_cfg.get("noise_std_type", "scalar")
-            print(f"[Runner] init_noise_std from config = {init_noise_std}, noise_std_type = {noise_std_type}")
-            num_actions = self.alg.policy.std.shape[0] if hasattr(self.alg.policy, 'std') else self.alg.policy.log_std.shape[0]
+            if hasattr(self.alg.policy, "latent_log_std"):
+                init_latent = float(self.policy_cfg.get("init_latent_std", init_noise_std))
+                self.alg.policy.latent_log_std.data.fill_(math.log(max(init_latent, 1.0e-6)))
+                print(f"[Runner] Reset latent_log_std to log({init_latent}) (reset_noise_std_on_resume=True)")
+            else:
+                noise_std_type = self.policy_cfg.get("noise_std_type", "scalar")
+                print(f"[Runner] init_noise_std from config = {init_noise_std}, noise_std_type = {noise_std_type}")
+                num_actions = self.alg.policy.std.shape[0] if hasattr(self.alg.policy, 'std') else self.alg.policy.log_std.shape[0]
 
-            if noise_std_type == "scalar":
-                self.alg.policy.std.data = torch.ones(num_actions, device=self.device) * init_noise_std
-                print(f"[Runner] Reset noise std to {init_noise_std} (reset_noise_std_on_resume=True)")
-            elif noise_std_type == "log":
-                self.alg.policy.log_std.data = torch.log(torch.ones(num_actions, device=self.device) * init_noise_std)
-                print(f"[Runner] Reset log noise std to log({init_noise_std}) (reset_noise_std_on_resume=True)")
+                if noise_std_type == "scalar":
+                    self.alg.policy.std.data = torch.ones(num_actions, device=self.device) * init_noise_std
+                    print(f"[Runner] Reset noise std to {init_noise_std} (reset_noise_std_on_resume=True)")
+                elif noise_std_type == "log":
+                    self.alg.policy.log_std.data = torch.log(torch.ones(num_actions, device=self.device) * init_noise_std)
+                    print(f"[Runner] Reset log noise std to log({init_noise_std}) (reset_noise_std_on_resume=True)")
 
         # -- Freeze normalizer if specified in config (for stage transitions)
         # This prevents normalizer statistics from drifting when resuming from distillation

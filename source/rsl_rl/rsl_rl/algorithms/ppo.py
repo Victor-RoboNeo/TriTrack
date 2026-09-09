@@ -180,6 +180,10 @@ class PPO:
         self.transition.clear()
         self.policy.reset(dones)
 
+    def _augment_actor_loss(self, loss, obs_batch, surrogate_loss):
+        """Hook for extra actor regularizers (parent-anchor, etc.). Default: no-op."""
+        return loss
+
     def compute_returns(self, last_critic_obs):
         # compute value for the last step
         last_values = self.policy.evaluate(last_critic_obs).detach()
@@ -368,6 +372,7 @@ class PPO:
 
             # Combine losses (standard PPO: actor + critic + entropy).
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            loss = self._augment_actor_loss(loss, obs_batch, surrogate_loss)
 
             # Symmetry loss
             if self.symmetry:

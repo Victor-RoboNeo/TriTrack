@@ -12,8 +12,16 @@ from dataclasses import dataclass
 from isaaclab.assets import ArticulationCfg
 
 from .g1 import G1_CYLINDER_CFG
-from .h1_2 import H1_2_CYLINDER_CFG
-from .adam import ADAM_CYLINDER_CFG
+
+try:
+    from .h1_2 import H1_2_CYLINDER_CFG
+except ImportError:
+    H1_2_CYLINDER_CFG = None
+
+try:
+    from .adam import ADAM_CYLINDER_CFG
+except ImportError:
+    ADAM_CYLINDER_CFG = None
 
 
 @dataclass(frozen=True)
@@ -61,7 +69,10 @@ ROBOT_PLATFORMS: dict[str, RobotPlatformSpec] = {
             "right_wrist_yaw_joint",
         ],
     ),
-    "h1_2": RobotPlatformSpec(
+}
+
+if H1_2_CYLINDER_CFG is not None:
+    ROBOT_PLATFORMS["h1_2"] = RobotPlatformSpec(
         name="h1_2",
         cfg=H1_2_CYLINDER_CFG,
         joint_names=[
@@ -93,8 +104,10 @@ ROBOT_PLATFORMS: dict[str, RobotPlatformSpec] = {
             "right_wrist_pitch_joint",
             "right_wrist_yaw_joint",
         ],
-    ),
-    "adam": RobotPlatformSpec(
+    )
+
+if ADAM_CYLINDER_CFG is not None:
+    ROBOT_PLATFORMS["adam"] = RobotPlatformSpec(
         name="adam",
         cfg=ADAM_CYLINDER_CFG,
         joint_names=[
@@ -122,8 +135,7 @@ ROBOT_PLATFORMS: dict[str, RobotPlatformSpec] = {
             "shoulderYaw_Right",
             "elbow_Right",
         ],
-    ),
-}
+    )
 
 
 def available_robot_names() -> list[str]:

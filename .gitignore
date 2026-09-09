@@ -1,0 +1,95 @@
+# =============================================================================
+# GitHub = code only. Data / checkpoints / wandb live on ModelScope.
+# Secrets never leave this machine via git.
+# =============================================================================
+
+# --- credentials / local sync config ---
+scripts/sync_remotes.env
+**/.env
+**/.env.*
+!**/.env.example
+!**/*.env.example
+**/secrets/
+
+# --- datasets, checkpoints, experiment dumps ---
+datasets/
+logs/
+results/
+outputs/
+exports/
+wandb/
+**/runs/
+**/recordings/
+**/videos/
+
+# --- model / motion binaries (safety net even outside the dirs above) ---
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.bin
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.rar
+*.usd
+*.usda
+*.usdc
+*.usdz
+
+# --- python / tooling ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+*.so
+
+# --- editors / OS ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Isaac / Omniverse local junk ---
+**/*.dmp
+**/.thumbs
+_isaac_sim*
+_repo
+_build
+.lastformat
+kit-crash*
+
+# --- ModelScope / git upload caches ---
+.ms_upload_cache/
+**/.ms_upload_cache/
+.cache/
+**/.cache/
+
+# --- local install leftovers ---
+continue_anybody_install.sh
+finish_anybody_install.sh
+setup_anybody_and_train.sh
+*.log
+core

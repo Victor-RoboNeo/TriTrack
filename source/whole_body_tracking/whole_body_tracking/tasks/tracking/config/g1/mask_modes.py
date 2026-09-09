@@ -177,9 +177,14 @@ _EVAL_SINGLE_MODES: dict[str, list[str]] = {
     "kp5_torso": ["torso_link"],
     "kp5_wrists": ["left_wrist_yaw_link", "right_wrist_yaw_link"],
     "kp5_ankles": ["left_ankle_roll_link", "right_ankle_roll_link"],
+    # P1 1-point alias (same bodies as kp5_torso).
+    "torso": ["torso_link"],
     # VR deploy mode (headset + 2 hand controllers): wrists + torso. Matches the ``vr`` entry
     # in :func:`muse_kp5_latent_demo_mode_spec` (latent-distill 8-mode demo spec).
     "vr": ["left_wrist_yaw_link", "right_wrist_yaw_link", "torso_link"],
+    # Head always on + 0-2 wrists (torso stands in for the headset).
+    "head_left": ["torso_link", "left_wrist_yaw_link"],
+    "head_right": ["torso_link", "right_wrist_yaw_link"],
     # Eval-only single-/dual-wrist drag modes (diagnostic for one-hand vs two-hand following).
     "wrist_only": ["left_wrist_yaw_link", "right_wrist_yaw_link"],
     "left_wrist_only": ["left_wrist_yaw_link"],
@@ -603,6 +608,22 @@ MUSE_KP5_LATENT_DEMO_MIX_PROBS = (0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.12
 """Final-phase mode_probs: 0.1 each of the 7 explicit demo modes + 0.3 bernoulli (sums to 1.0)."""
 
 MUSE_KP5_LATENT_DEMO_MIX_PROBS_NO_BERNOULLI = (1/7, 1/7, 1/7, 1/7, 1/7, 1/7, 1/7, 0)
+
+
+# Head (torso) always visible; independently 0 / 1 / 2 wrists. Ankles never shown.
+# Uniform over hand-count: P(0)=P(1)=P(2)=1/3, and P(L)=P(R)=1/6 when one hand.
+MUSE_KP5_HEAD_HANDS_MODE_NAMES = ("torso", "head_left", "head_right", "vr")
+MUSE_KP5_HEAD_HANDS_PROBS = (1.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 3.0)
+
+
+def muse_kp5_head_hands_mode_spec() -> dict[str, list[str]]:
+    """4-mode spec: torso always on, wrists 0-2, ankles off. Subset of KP5 bodies."""
+    return {
+        "torso": ["torso_link"],
+        "head_left": ["torso_link", "left_wrist_yaw_link"],
+        "head_right": ["torso_link", "right_wrist_yaw_link"],
+        "vr": ["torso_link", "left_wrist_yaw_link", "right_wrist_yaw_link"],
+    }
 
 
 def muse_kp5_latent_demo_mode_spec() -> dict[str, list[str]]:

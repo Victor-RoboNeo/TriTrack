@@ -12,7 +12,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 
 from whole_body_tracking.tasks.tracking.mdp.commands import MotionCommand
-from whole_body_tracking.tasks.tracking.mdp.rewards import _get_body_indexes
+from whole_body_tracking.tasks.tracking.mdp.rewards import _ankle_mean_z_offset, _get_body_indexes
 
 
 def bad_anchor_pos(env: ManagerBasedRLEnv, command_name: str, threshold: float) -> torch.Tensor:
@@ -23,6 +23,19 @@ def bad_anchor_pos(env: ManagerBasedRLEnv, command_name: str, threshold: float) 
 def bad_anchor_pos_z_only(env: ManagerBasedRLEnv, command_name: str, threshold: float) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
     return torch.abs(command.anchor_pos_w[:, -1] - command.robot_anchor_pos_w[:, -1]) > threshold
+
+
+def bad_anchor_pos_z_only_terrain_rel(
+    env: ManagerBasedRLEnv, command_name: str, threshold: float
+) -> torch.Tensor:
+    """Anchor z termination after subtracting the ankle-mean terrain offset.
+
+    Without this, stairs/slopes look like a 0.25 m fall vs a flat-recorded clip.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    offset = _ankle_mean_z_offset(command)
+    adj = (command.anchor_pos_w[:, -1] - command.robot_anchor_pos_w[:, -1]) + offset
+    return torch.abs(adj) > threshold
 
 
 def bad_anchor_ori(

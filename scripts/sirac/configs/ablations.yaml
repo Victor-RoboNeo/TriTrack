@@ -1,0 +1,19 @@
+# Ablation configs. None of these introduce terrain identity or task routing.
+
+ablation_direct_vs_bottleneck:
+  compare: [A_stage2_direct, B_realization_lbc]
+ablation_frozen_vs_finetuned:
+  compare: [B_realization_lbc]
+  note: "Fine-tuned LBC is not trained in Phase 1A. Slot reserved."
+ablation_future_intent:
+  compare: [B_realization_lbc]
+  future_intent: [false, true]
+  note: "true requires a trained IntentConditionedLBC; disabled until then."
+ablation_history:
+  student_history_frames: [2, 16]
+  note: "2 frames = frozen public student (40 ms). 16 frames = 320 ms, needs retraining."
+ablation_upper_body_dist:
+  distributions: [static_arms, amass_arms, sparse_intent, stage2_upper]
+ablation_torso_frame:
+  torso_features: [pelvis_yaw_relative, world_frame]
+  note: "world_frame is an ablation only; default extractor uses pelvis-yaw relative."

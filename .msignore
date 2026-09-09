@@ -1,0 +1,44 @@
+# =============================================================================
+# ModelScope ignore (data + ckpt upload).
+# Globs are matched against paths *relative to each uploaded folder*
+# (datasets/, logs/rsl_rl/, results/, exports/), so keep them folder-agnostic.
+# Syntax: one glob per line. Blank lines and # comments are skipped.
+# =============================================================================
+
+# VCS / caches / secrets
+**/.git/**
+**/.git
+**/.cache/**
+**/.ms_upload_cache/**
+**/.env
+**/sync_remotes.env
+
+# Python / editor junk
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/**
+**/.ipynb_checkpoints/**
+**/.idea/**
+**/.vscode/**
+**/.DS_Store
+
+# Training telemetry (not checkpoints)
+**/wandb/**
+**/outputs/**
+**/*.dmp
+**/.thumbs
+**/core
+kit-crash*
+
+# HuggingFace nested caches
+**/.cache/huggingface/**
+
+# -----------------------------------------------------------------------------
+# bones-seed (~389 GB) is already public: modelscope.cn/datasets/bones-studio/seed
+# The update script keeps this exclude unless INCLUDE_BONES_SEED=1.
+# Patterns must match when uploading the datasets/ folder itself:
+# -----------------------------------------------------------------------------
+bones-seed/**
+bones-seed
+**/bones-seed/**

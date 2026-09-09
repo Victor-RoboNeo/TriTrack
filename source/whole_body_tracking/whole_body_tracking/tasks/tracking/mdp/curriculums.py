@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+import torch
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -262,3 +264,79 @@ def goal_mask_probability_curriculum(
     motion = env.command_manager.get_term(command_name)
     motion.p_mask = p_mask
     return {"goal_mask_p": p_mask, "goal_mask_iter": float(current_iter)}
+
+
+def motion_group_ratio_curriculum(
+    env: "ManagerBasedRLEnv",
+    env_ids: Sequence[int],
+    command_name: str = "motion",
+    phase_until_learning_iterations: tuple[int | None, ...] = (3000, 8000, None),
+    ratio_phases: tuple[dict[str, float], ...] = (
+        {"loco": 0.70, "stoop": 0.10, "default": 0.20},
+        {"loco": 0.45, "stoop": 0.20, "default": 0.35},
+        {"loco": 0.40, "stoop": 0.25, "default": 0.35},
+    ),
+) -> dict[str, float]:
+    """Schedule ``motion_group_sampling_ratios`` by PPO iteration.
+
+    Phase 0 emphasizes locomotion so the frozen decoder's walk prior is reused; later
+    phases mix in stoop (height change) and high-dynamic default clips (kick/throw/…).
+    Ratios are read on the next motion resample.
+    """
+    del env_ids
+    if len(phase_until_learning_iterations) != len(ratio_phases):
+        raise ValueError(
+            "motion_group_ratio_curriculum: phase_until_learning_iterations and "
+            f"ratio_phases must have the same length (got {len(phase_until_learning_iterations)} vs "
+            f"{len(ratio_phases)})."
+        )
+    spe = int(getattr(env, "curriculum_env_steps_per_learning_iteration", 0))
+    if spe <= 0:
+        current_iter = 0
+    else:
+        current_iter = _virtual_env_step_for_curriculum(env) // spe
+
+    active = 0
+    for i, bound in enumerate(phase_until_learning_iterations):
+        active = i
+        if bound is None or current_iter < int(bound):
+            break
+
+    ratios = {str(k): float(v) for k, v in ratio_phases[active].items()}
+    total = sum(ratios.values())
+    if total <= 0.0:
+        raise ValueError(f"motion_group_ratio_curriculum: phase {active} ratios sum to {total}.")
+    if abs(total - 1.0) > 1e-5:
+        ratios = {k: v / total for k, v in ratios.items()}
+
+    motion = env.command_manager.get_term(command_name)
+    motion.cfg.motion_group_sampling_ratios = ratios
+    out = {f"motion_group_{k}": float(v) for k, v in ratios.items()}
+    out["motion_group_phase"] = float(active)
+    out["motion_group_iter"] = float(current_iter)
+    return out
+
+
+def terrain_levels_tracking(
+    env: "ManagerBasedRLEnv",
+    env_ids: Sequence[int],
+    move_up_frac: float = 0.60,
+    move_down_frac: float = 0.25,
+):
+    """Promote/demote generator terrain level from episode length (tracking analogue of velocity terrain curriculum).
+
+    Long episodes (clip nearly finished, few early terms) move up; very short episodes move down.
+    No height scan is added to the actor.
+    """
+    terrain = env.scene.terrain
+    if not hasattr(terrain, "update_env_origins") or getattr(terrain, "terrain_origins", None) is None:
+        return None
+    ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+    if ids.numel() == 0:
+        return torch.mean(terrain.terrain_levels.float())
+    length = env.episode_length_buf[ids].float()
+    max_len = float(env.max_episode_length)
+    move_up = length > float(move_up_frac) * max_len
+    move_down = (length < float(move_down_frac) * max_len) & ~move_up
+    terrain.update_env_origins(ids, move_up, move_down)
+    return torch.mean(terrain.terrain_levels.float())

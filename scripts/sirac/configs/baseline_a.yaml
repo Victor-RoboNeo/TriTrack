@@ -1,0 +1,17 @@
+# SIRAC Phase-1 baseline configs. Original AnyBody Stage-2 configs are not modified.
+# Human-owned intent: head SE(3), left-hand SE(3), right-hand SE(3) only.
+# Realization command is robot-owned.
+
+name: A_stage2_direct
+baseline: A_stage2_direct
+description: Existing Stage-2 decoder writes all 29 DoF (lower+waist+arms).
+num_envs: 16
+seed: 42
+episode_length_s: 10.0
+headless: true
+use_frozen_lbc: false
+static_arms: false
+future_intent: false
+navigator_enabled: false
+governor_enabled: false
+notes: "Do not overwrite eval_irr_r3_short.py; this is a parallel SIRAC eval path."

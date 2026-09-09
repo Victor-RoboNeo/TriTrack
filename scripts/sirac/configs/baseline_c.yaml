@@ -1,0 +1,18 @@
+name: C_static_arms_lbc
+baseline: C_static_arms_lbc
+description: >
+  Same as Baseline B but arms held at HTD zeros. Isolates interface/LBC errors
+  from upper-body-induced dynamic disturbance.
+num_envs: 16
+seed: 42
+episode_length_s: 10.0
+headless: true
+use_frozen_lbc: true
+static_arms: true
+future_intent: false
+navigator_enabled: false
+governor_enabled: false
+command_clip: deploy
+student_history_frames: 2
+action_scale: 0.25
+default_pose: htd
